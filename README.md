@@ -12,6 +12,7 @@
     <img src="https://img.shields.io/badge/NeurIPS2024-blue" alt="arxiv">
   </a>
 </p>
+
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
 |-------------------------|-------------------------|
