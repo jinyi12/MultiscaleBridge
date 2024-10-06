@@ -38,6 +38,15 @@ conda activate dbfs
 pip install -r requirements.txt
 ```
 
+## Download AFHQ dataset
+<!-- https://github.com/clovaai/stargan-v2#animal-faces-hq-dataset-afhq -->
+Download the AFHQ dataset from [stargan-v2](https://github.com/clovaai/stargan-v2#animal-faces-hq-dataset-afhq), and save them in the `dbfs/data` directory.
+
+You can also download the dataset with the following commands:
+```
+bash download.sh afhq-dataset
+```
+
 
 ## Sampling from trained models
 You can download the model checkpoints from [Google Drive](https://drive.google.com/drive/folders/18aX0pU2rE8bnBAT6ytAxc8yTpel2aezg?usp=drive_link) and save them in the `dbfs/checkpoint` directory.
