@@ -38,19 +38,33 @@ conda activate dbfs
 pip install -r requirements.txt
 ```
 
-## Training
+
+## Sampling from trained models
+You can download the model checkpoints from [Google Drive](https://drive.google.com/drive/folders/18aX0pU2rE8bnBAT6ytAxc8yTpel2aezg?usp=drive_link) and save them in the `dbfs/checkpoints` directory.
+
+See `dbfs/dbfs_{DATASET}_sample.ipynb` for sampling from the trained models.
+
+
+## Training from scratch
+We train DBFS with single or multi A6000 GPUs for each dataset.
+
+You can also adjust the `--batch_dim` and `--nproc-per-node` options according to your local resources.
+
+### EMNIST ⇆ MNIST
+#### For Single-GPU
 ```
-python dbfs_mnist.py
+CUDA_VISIBLE_DEVICES=0 python dbfs_mnist.py
+```
+#### For Multi-GPU
+```
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 python dbfs_mnist.py
 ```
 
+### AFHQ-64 Wild ⇆ Cat
+#### For Multi-GPU
 ```
-python dbfs_afhq.py
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node 8 python dbfs_afhq.py
 ```
-
-## Evaluation
-
-
-
 
 
 # Acknowledgements

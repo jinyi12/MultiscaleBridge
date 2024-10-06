@@ -378,8 +378,8 @@ def run(
     fwd_nn = init_nn().to(device)
     # DDP
     if parallel:
-        bwd_nn = DDP(bwd_nn.to(device), device_ids=[device], find_unused_parameters=False)
-        fwd_nn = DDP(fwd_nn.to(device), device_ids=[device], find_unused_parameters=False)
+        bwd_nn = DDP(bwd_nn, device_ids=[device])
+        fwd_nn = DDP(fwd_nn, device_ids=[device])
 
     if rank == 0:
         console.log(f"# param of bwd nn: {count_parameters(bwd_nn)}")
