@@ -13,7 +13,7 @@
   </a>
 </p>
 
-[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://arxiv.org/abs/2405.20630) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner. .
+[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://arxiv.org/abs/2405.20630) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner.
 
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
