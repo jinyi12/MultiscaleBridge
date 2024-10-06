@@ -90,6 +90,6 @@ If you found our work useful for your research, please consider citing our work.
 ```
 
 # Acknowledgements
-Our code builds upon an outstanding open source project and paper:
+Our code builds upon an outstanding open source projects and papers:
 * [Diffusion Bridge Mixture Transports, Schrödinger Bridge Problems and Generative Modeling](https://arxiv.org/abs/2304.00917).
 * [Score-based Generative Modeling through Stochastic Evolution Equations in Hilbert Spaces](https://openreview.net/pdf?id=GrElRvXnEj).
