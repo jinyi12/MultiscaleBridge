@@ -13,14 +13,16 @@
   </a>
 </p>
 
+[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://arxiv.org/abs/2405.20630) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner. .
+
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
 |-------------------------|-------------------------|
-| EMNIST ⇆ MNIST (32x32) | <p float="left"> <img src="./assets/emnist2mnist_32.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_32.gif" alt="drawing" width="180"/> </p>  |
-| EMNIST ⇆ MNIST (64x64) | <p float="left"> <img src="./assets/emnist2mnist_64.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_64.gif" alt="drawing" width="180"/> </p>  |
-| EMNIST ⇆ MNIST (128x128) | <p float="left"> <img src="./assets/emnist2mnist_128.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_128.gif" alt="drawing" width="180"/> </p>  |
-| AFHQ-64 Wild ⇆ Cat (64x64) | <p float="left"> <img src="./assets/wild2cat_64.gif" alt="drawing" width="180"/>  <img src="./assets/cat2wild_64.gif" alt="drawing" width="180"/> </p> | 
-| AFHQ-64 Wild ⇆ Cat (128x128) | <p float="left"> <img src="./assets/wild2cat_128.gif" alt="drawing" width="180"/>  <img src="./assets/cat2wild_128.gif" alt="drawing" width="180"/> </p> | 
+| EMNIST ⇆ MNIST (32x32, observed) | <p float="left"> <img src="./assets/emnist2mnist_32.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_32.gif" alt="drawing" width="180"/> </p>  |
+| EMNIST ⇆ MNIST (64x64, unseen) | <p float="left"> <img src="./assets/emnist2mnist_64.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_64.gif" alt="drawing" width="180"/> </p>  |
+| EMNIST ⇆ MNIST (128x128, unseen) | <p float="left"> <img src="./assets/emnist2mnist_128.gif" alt="drawing" width="180"/>  <img src="./assets/mnist2emnist_128.gif" alt="drawing" width="180"/> </p>  |
+| AFHQ-64 Wild ⇆ Cat (64x64, observed) | <p float="left"> <img src="./assets/wild2cat_64.gif" alt="drawing" width="180"/>  <img src="./assets/cat2wild_64.gif" alt="drawing" width="180"/> </p> | 
+| AFHQ-64 Wild ⇆ Cat (128x128, unseen) | <p float="left"> <img src="./assets/wild2cat_128.gif" alt="drawing" width="180"/>  <img src="./assets/cat2wild_128.gif" alt="drawing" width="180"/> </p> | 
 
 ## Installation
 This code is developed with Python3 and Pytorch. To set up an environment with the required packages,
@@ -54,3 +56,4 @@ python dbfs_afhq.py
 # Acknowledgements
 Our code builds upon an outstanding open source project and paper:
 * [Diffusion Bridge Mixture Transports, Schrödinger Bridge Problems and Generative Modeling](https://arxiv.org/abs/2304.00917).
+* [Score-based Generative Modeling through Stochastic Evolution Equations in Hilbert Spaces](https://openreview.net/pdf?id=GrElRvXnEj).
