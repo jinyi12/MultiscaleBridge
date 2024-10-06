@@ -9,7 +9,7 @@
 <br>
 <p align="center">
   <a href="https://arxiv.org/abs/2405.20630">
-    <img src="https://img.shields.io/badge/NeurIPS2024-blue" alt="arxiv">
+    <img src="https://img.shields.io/badge/arxiv-blue" alt="arxiv">
   </a>
 </p>
 
@@ -75,6 +75,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 dbfs_mnist.py
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node 8 dbfs_afhq.py
 ```
 
+The running histories are available on [Weights & Biases](https://wandb.ai/bwpark99/dbfs-publication/workspace?nw=nwuserbwpark99) for reproducibility.
 
 # Acknowledgements
 Our code builds upon an outstanding open source project and paper:
