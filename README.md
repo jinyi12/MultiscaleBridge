@@ -77,6 +77,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node 8 dbfs_afhq.py
 
 The running histories are available on [Weights & Biases](https://wandb.ai/bwpark99/dbfs-publication/workspace?nw=nwuserbwpark99) for reproducibility.
 
+# Reference 
+If you found our work useful for your research, please consider citing our work.
+
+```
+@article{park2024stochastic,
+  title={Stochastic Optimal Control for Diffusion Bridges in Function Spaces},
+  author={Park, Byoungwoo and Choi, Jungwon and Lim, Sungbin and Lee, Juho},
+  journal={arXiv preprint arXiv:2405.20630},
+  year={2024}
+}
+```
+
 # Acknowledgements
 Our code builds upon an outstanding open source project and paper:
 * [Diffusion Bridge Mixture Transports, Schrödinger Bridge Problems and Generative Modeling](https://arxiv.org/abs/2304.00917).
