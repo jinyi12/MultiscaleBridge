@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 
 ## Sampling from trained models
-You can download the model checkpoints from [Google Drive](https://drive.google.com/drive/folders/18aX0pU2rE8bnBAT6ytAxc8yTpel2aezg?usp=drive_link) and save them in the `dbfs/checkpoints` directory.
+You can download the model checkpoints from [Google Drive](https://drive.google.com/drive/folders/18aX0pU2rE8bnBAT6ytAxc8yTpel2aezg?usp=drive_link) and save them in the `dbfs/checkpoint` directory.
 
 See `dbfs/dbfs_{DATASET}_sample.ipynb` for sampling from the trained models.
 
