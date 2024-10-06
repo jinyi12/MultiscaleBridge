@@ -57,13 +57,13 @@ CUDA_VISIBLE_DEVICES=0 python dbfs_mnist.py
 ```
 #### For Multi-GPU
 ```
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 python dbfs_mnist.py
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 dbfs_mnist.py
 ```
 
 ### AFHQ-64 Wild ⇆ Cat
 #### For Multi-GPU
 ```
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node 8 python dbfs_afhq.py
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc-per-node 8 dbfs_afhq.py
 ```
 
 
