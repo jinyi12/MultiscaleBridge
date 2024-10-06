@@ -7,10 +7,11 @@
   <sup>1</sup>KAIST &emsp; <sup>2</sup>Korea University &emsp; <sup>3</sup>LG AI Research<br>
 </div>
 <br>
-<div align="center">
-[![arxiv](https://img.shields.io/badge/NeurIPS2024-blue)](https://arxiv.org/abs/2405.20630)
-</div>
-
+<p align="center">
+  <a href="https://arxiv.org/abs/2405.20630">
+    <img src="https://img.shields.io/badge/NeurIPS2024-blue" alt="arxiv">
+  </a>
+</p>
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
 |-------------------------|-------------------------|
