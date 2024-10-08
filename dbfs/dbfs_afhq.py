@@ -229,7 +229,7 @@ transform=transforms.Compose(
 tr_dataset= datasets.ImageFolder(root='./data/afhq/train', transform=transform)
 
 tr_idx_0 = [i for i in range(len(tr_dataset)) if tr_dataset.imgs[i][1] == tr_dataset.class_to_idx['cat']]
-tr_idx_1 = [i for i in range(len(tr_dataset)) if tr_dataset.imgs[i][1] == tr_dataset.class_to_idx['dog']]
+tr_idx_1 = [i for i in range(len(tr_dataset)) if tr_dataset.imgs[i][1] == tr_dataset.class_to_idx['wild']]
 
 tr_data_0 = Subset(tr_dataset, tr_idx_0)
 tr_data_1 = Subset(tr_dataset, tr_idx_1)
@@ -237,7 +237,7 @@ tr_data_1 = Subset(tr_dataset, tr_idx_1)
 te_dataset= datasets.ImageFolder(root='./data/afhq/val', transform=transform)
 
 te_idx_0 = [i for i in range(len(te_dataset)) if te_dataset.imgs[i][1] == te_dataset.class_to_idx['cat']]
-te_idx_1 = [i for i in range(len(te_dataset)) if te_dataset.imgs[i][1] == te_dataset.class_to_idx['dog']]
+te_idx_1 = [i for i in range(len(te_dataset)) if te_dataset.imgs[i][1] == te_dataset.class_to_idx['wild']]
 
 te_data_0 = Subset(te_dataset, te_idx_0)
 te_data_1 = Subset(te_dataset, te_idx_1)
