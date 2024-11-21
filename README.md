@@ -9,7 +9,7 @@
 <br>
 <p align="center">
   <a href="https://arxiv.org/abs/2405.20630">
-    <img src="https://img.shields.io/badge/arxiv-blue" alt="arxiv">
+    <img src="https://img.shields.io/badge/neurips-blue" alt="neurips">
   </a>
 </p>
 
