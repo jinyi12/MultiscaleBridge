@@ -8,12 +8,12 @@
 </div>
 <br>
 <p align="center">
-  <a href="https://openreview.net/forum?id=GLxbQTtb2T">
+  <a href="https://openreview.net/forum?id=WyQW4G57Zd">
     <img src="https://img.shields.io/badge/Neurips2024-blue" alt="Neurips">
   </a>
 </p>
 
-[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://openreview.net/forum?id=GLxbQTtb2T) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner.
+[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://openreview.net/forum?id=WyQW4G57Zd) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner.
 
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
