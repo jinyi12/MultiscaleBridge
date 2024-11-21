@@ -8,12 +8,12 @@
 </div>
 <br>
 <p align="center">
-  <a href="https://arxiv.org/abs/2405.20630">
-    <img src="https://img.shields.io/badge/neurips-blue" alt="neurips">
+  <a href="https://openreview.net/forum?id=GLxbQTtb2T">
+    <img src="https://img.shields.io/badge/Neurips2024-blue" alt="Neurips">
   </a>
 </p>
 
-[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://arxiv.org/abs/2405.20630) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner.
+[Stochastic Optimal Control for Diffusion Bridges in Function Spaces](https://openreview.net/forum?id=GLxbQTtb2T) (**DBFS**) extends previous bridge matching algorithms to learn diffusion models between two infinite-dimensional distributions in a resolution-free manner.
 
 ## Examples
 | pi_0 ⇆ pi_T | Results (left: pi_0 → pi_T, right: pi_0 ← pi_T) |
@@ -81,11 +81,13 @@ The running histories are available on [Weights & Biases](https://wandb.ai/bwpar
 If you found our work useful for your research, please consider citing our work.
 
 ```
-@article{park2024stochastic,
+@inproceedings{
+  park2024stochastic,
   title={Stochastic Optimal Control for Diffusion Bridges in Function Spaces},
-  author={Park, Byoungwoo and Choi, Jungwon and Lim, Sungbin and Lee, Juho},
-  journal={arXiv preprint arXiv:2405.20630},
-  year={2024}
+  author={Byoungwoo Park and Jungwon Choi and Sungbin Lim and Juho Lee},
+  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
+  year={2024},
+  url={https://openreview.net/forum?id=WyQW4G57Zd}
 }
 ```
 
