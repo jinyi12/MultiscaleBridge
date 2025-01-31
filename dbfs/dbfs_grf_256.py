@@ -58,6 +58,57 @@ else:
 
 DBFS = "DBFS"
 
+# Coarsening function
+import torch.nn.functional as F
+
+
+def coarsen_field(field, filter_sigma=2.0, downsample_factor=2, method="bilinear"):
+    """
+    Coarsen a field by smoothing and downsampling.
+
+    Args:
+        field (torch.Tensor): Input tensor of shape [B, C, H, W] or [C, H, W].
+        filter_sigma (float): Standard deviation for Gaussian kernel.
+        downsample_factor (int): Factor by which to downsample spatial dimensions.
+        method (str): Interpolation method - 'bilinear' or 'bicubic'.
+
+    Returns:
+        torch.Tensor: Coarsened tensor.
+    """
+    if not isinstance(field, th.Tensor):
+        raise ValueError("Field must be a torch tensor")
+
+    # Handle input dimensions
+    if field.dim() == 3:
+        field = field.unsqueeze(0)  # Add batch dimension: [1, C, H, W]
+        squeeze = True
+    elif field.dim() == 4:
+        squeeze = False
+    else:
+        raise ValueError("Field must have 3 or 4 dimensions [C, H, W] or [B, C, H, W]")
+
+    # Calculate kernel size: typically 4 times sigma, rounded to the nearest odd integer
+    kernel_size = 2 * int(4 * filter_sigma + 0.5) + 1
+
+    # Apply Gaussian smoothing
+    smooth = F.gaussian_blur(
+        field,
+        kernel_size=(kernel_size, kernel_size),
+        sigma=(filter_sigma, filter_sigma),
+    )
+
+    # Downsample using interpolation
+    scale_factor = 1.0 / downsample_factor
+    coarse = th.nn.functional.interpolate(
+        smooth, scale_factor=scale_factor, mode=method, align_corners=False
+    )
+
+    if squeeze:
+        coarse = coarse.squeeze(0)  # Remove batch dimension if it was added
+
+    return coarse
+
+
 # Routines -----------------------------------------------------------------------------
 
 
@@ -661,8 +712,17 @@ def run(
                 losses = (target_t - alpha_t) ** 2
                 losses = th.mean(losses.reshape(losses.shape[0], -1), dim=1)
 
-                if direction == "fwd":
-                    losses_intOperator = (target_t - coarsen_field(x_0)) ** 2
+                if direction == "bwd":
+                    losses_intOperator = (
+                        target_t - coarsen_field(x_0, downsample_factor=1)
+                    ) ** 2
+
+                    losses_intOperator = th.mean(
+                        losses_intOperator.reshape(losses_intOperator.shape[0], -1),
+                        dim=1,
+                    )
+
+                    losses = losses + losses_intOperator
 
                 loss = th.mean(losses)
 
@@ -704,37 +764,50 @@ def run(
                     # console.log("te_loader_x_1: ", len(te_loader_x_1))
 
                     for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
+                        # x_1 is coarse field if backward direction, fine field if forward direction
+                        # x_0 is fine field if backward direction, coarse field if forward direction
                         te_x_0, te_x_1 = te_x_0.to(device), te_x_1.to(device)
                         te_s_path[0] = te_x_0
                         drift_norm.append(
                             euler_discretization(te_s_path, te_p_path, sample_nn, sigma)
                         )
 
-                        # Denormalize for physical meaningful L2 loss, choose normalizer based on direction
-                        denorm = DatasetDenormalization(
-                            (
-                                coarse_normalizer.mean
-                                if direction == "fwd"
-                                else fine_normalizer.mean
-                            ),
-                            (
-                                coarse_normalizer.std
-                                if direction == "fwd"
-                                else fine_normalizer.std
-                            ),
-                        )
-
                         # Compute L2 loss between generated field and target
-                        generated_field_denorm = denorm(te_s_path[-1])
-                        target_field_denorm = denorm(te_x_1)
+                        generated_field = te_s_path[-1]
 
-                        l2_loss = th.nn.functional.mse_loss(
-                            generated_field_denorm, target_field_denorm
-                        )
+                        if direction == "fwd":
+                            # if forward, we want to coarsen the generated fine field
+                            # to calculate the L2 loss with the starting coarse field
+                            # to ensure the coarsen
+                            # field is of same regularity as the starting field
+                            target_field = te_x_0
+                            generated_field = coarsen_field(
+                                generated_field, downsample_factor=1
+                            )
+
+                            l2_loss = th.nn.functional.mse_loss(
+                                generated_field, target_field
+                            )
+                        else:
+                            # if backward, we want to compare the generated coarse field
+                            # with the target coarse field
+                            target_field = te_x_1
+                            l2_loss = th.nn.functional.mse_loss(
+                                generated_field, target_field
+                            )
+
                         l2_losses.append(l2_loss.item())
 
                     drift_norm = th.mean(th.cat(drift_norm)).item()
                     mean_l2_loss = np.mean(l2_losses)
+
+                    denorm_fine = DatasetDenormalization(
+                        fine_normalizer.mean, fine_normalizer.std
+                    )
+                    denorm_coarse = DatasetDenormalization(
+                        coarse_normalizer.mean, coarse_normalizer.std
+                    )
+
                     if rank == 0:
                         wandb.log(
                             {f"{direction}/test/drift_norm": drift_norm}, step=step
@@ -754,7 +827,11 @@ def run(
                         resample_indices(discretization_steps + 1, 5)
                     ):
                         if rank == 0:
-                            denorm_field = denorm(te_s_path[ti])
+                            denorm_field = (
+                                denorm_fine(te_s_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_s_path[ti])
+                            )
                             wandb.log(
                                 {
                                     f"{direction}/test/x[{i}-{5}]": image_grid(
@@ -765,7 +842,11 @@ def run(
                             )
                     for i, ti in enumerate(resample_indices(discretization_steps, 5)):
                         if rank == 0:
-                            denorm_field = denorm(te_p_path[ti])
+                            denorm_field = (
+                                denorm_fine(te_p_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_p_path[ti])
+                            )
                             wandb.log(
                                 {
                                     f"{direction}/test/p[{i}-{5}]": image_grid(
@@ -787,9 +868,12 @@ def run(
                         device=device,
                     )
                     # Physical field, dont assume range of [0, 1]
-                    drift_norm = []
-                    denorm = DatasetDenormalization(
+
+                    denorm_fine = DatasetDenormalization(
                         fine_normalizer.mean, fine_normalizer.std
+                    )
+                    denorm_coarse = DatasetDenormalization(
+                        coarse_normalizer.mean, coarse_normalizer.std
                     )
 
                     for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
@@ -808,7 +892,11 @@ def run(
                         resample_indices(discretization_steps + 1, 5)
                     ):
                         if rank == 0:
-                            denorm_field = denorm(te_s_path[ti])
+                            denorm_field = (
+                                denorm_fine(te_s_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_s_path[ti])
+                            )
                             wandb.log(
                                 {
                                     f"{direction}/test_32/x[{i}-{5}]": image_grid(
@@ -819,7 +907,11 @@ def run(
                             )
                     for i, ti in enumerate(resample_indices(discretization_steps, 5)):
                         if rank == 0:
-                            denorm_field = denorm(te_p_path[ti])
+                            denorm_field = (
+                                denorm_fine(te_p_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_p_path[ti])
+                            )
                             wandb.log(
                                 {
                                     f"{direction}/test_32/p[{i}-{5}]": image_grid(
@@ -925,10 +1017,10 @@ def restore_checkpoint(saves, console):
 if __name__ == "__main__":
     config = {
         "batch_dim": 64,  # Increased for better GPU utilization
-        "cache_batch_dim": 512,  #
+        "cache_batch_dim": 1024,  #
         "cache_steps": 250,
-        "test_steps": 5000,  # More frequent evaluation
-        "iterations": 45,
+        "test_steps": 2,  # More frequent evaluation
+        "iterations": 30,
         "load": False,  # continue training
     }
 
