@@ -58,10 +58,8 @@ else:
 
 DBFS = "DBFS"
 
+
 # Coarsening function
-import torch.nn.functional as F
-
-
 def coarsen_field(field, filter_sigma=2.0, downsample_factor=2, method="bilinear"):
     """
     Coarsen a field by smoothing and downsampling.
@@ -868,6 +866,7 @@ def run(
                         device=device,
                     )
                     # Physical field, dont assume range of [0, 1]
+                    drift_norm = []
 
                     denorm_fine = DatasetDenormalization(
                         fine_normalizer.mean, fine_normalizer.std
@@ -1019,7 +1018,7 @@ if __name__ == "__main__":
         "batch_dim": 64,  # Increased for better GPU utilization
         "cache_batch_dim": 1024,  #
         "cache_steps": 250,
-        "test_steps": 2,  # More frequent evaluation
+        "test_steps": 5000,  # More frequent evaluation
         "iterations": 30,
         "load": False,  # continue training
     }
