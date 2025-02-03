@@ -710,17 +710,17 @@ def run(
                 losses = (target_t - alpha_t) ** 2
                 losses = th.mean(losses.reshape(losses.shape[0], -1), dim=1)
 
-                # if direction == "bwd":
-                #     losses_intOperator = (
-                #         target_t - coarsen_field(x_0, downsample_factor=1)
-                #     ) ** 2
+                if direction == "bwd":
+                    losses_intOperator = (
+                        target_t - coarsen_field(x_0, downsample_factor=1)
+                    ) ** 2
 
-                #     losses_intOperator = th.mean(
-                #         losses_intOperator.reshape(losses_intOperator.shape[0], -1),
-                #         dim=1,
-                #     )
+                    losses_intOperator = th.mean(
+                        losses_intOperator.reshape(losses_intOperator.shape[0], -1),
+                        dim=1,
+                    )
 
-                #     losses = losses + losses_intOperator
+                    losses = losses + losses_intOperator
 
                 loss = th.mean(losses)
 
@@ -980,7 +980,7 @@ def save_checkpoint(saves, iteration, console):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
     checkpoint = {}
     i = 0
-    fn = "./checkpoint/grf_10k_256_original.npz"
+    fn = "./checkpoint/grf_10k_256.npz"
     keys = ["bwd_nn", "bwd_ema", "bwd_optim", "fwd_nn", "fwd_ema", "fwd_optim"]
 
     with th.cuda.device(rank):
@@ -996,7 +996,7 @@ def save_checkpoint(saves, iteration, console):
 def restore_checkpoint(saves, console):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
     i = 0
-    load_name = "./checkpoint/grf_10k_256_original.npz"
+    load_name = "./checkpoint/grf_10k_256.npz"
     assert load_name is not None
     if rank == 0:
         console.log(f"#loading checkpoint {load_name}...")
@@ -1019,8 +1019,7 @@ if __name__ == "__main__":
         "cache_batch_dim": 256,  #
         "cache_steps": 250,
         "test_steps": 5000,  # More frequent evaluation
-        # "iterations": 45,
-        "iterations": 32,
+        "iterations": 45,
         "load": False,  # continue training
     }
 
