@@ -908,8 +908,8 @@ def restore_checkpoint(saves, console):
 
 if __name__ == "__main__":
     config = {
-        "batch_dim": 64,  # Increased for better GPU utilization
-        "cache_batch_dim": 1280,  #
+        "batch_dim": 128,  # Increased for better GPU utilization
+        "cache_batch_dim": 2560,  #
         "cache_steps": 250,
         "test_steps": 5000,  # More frequent evaluation
         "iterations": 30,
