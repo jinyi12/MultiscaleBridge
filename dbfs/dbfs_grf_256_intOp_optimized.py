@@ -185,6 +185,8 @@ def euler_discretization_endpoints(x_0, nn, energy, discretization_steps=30):
 
     for i in range(1, discretization_steps + 1):
         t = th.full(size=(B,), fill_value=dt * (i - 1), device=x_0.device)
+        print("Shape of t: ", t.shape)
+        print("Shape of x_t: ", x_t.shape)
         alpha_t = nn(x_t, t)
         drift_norms = drift_norms + th.mean(alpha_t.view(B, -1) ** 2, dim=1)
 
@@ -212,9 +214,40 @@ def euler_discretization_endpoints(x_0, nn, energy, discretization_steps=30):
 def euler_discretization_full(x, xp, nn, energy, discretization_steps=30):
     """
     Full Euler discretization that returns the complete trajectory.
-    Used during evaluation/testing.
+    Processes data in smaller batches to avoid memory issues.
     """
-    T = discretization_steps  # Use specified steps
+    T = discretization_steps
+    batch_size = x.shape[1]
+    max_batch_size = 16  # Adjust based on GPU memory
+    
+    # Process in chunks if batch size is too large
+    if batch_size > max_batch_size:
+        num_chunks = (batch_size + max_batch_size - 1) // max_batch_size
+        drift_norms = []
+        
+        for i in range(num_chunks):
+            start_idx = i * max_batch_size
+            end_idx = min((i + 1) * max_batch_size, batch_size)
+            
+            x_chunk = x[:, start_idx:end_idx]
+            xp_chunk = xp[:, start_idx:end_idx]
+            
+            drift_norm = euler_discretization_full_chunk(
+                x_chunk, xp_chunk, nn, energy, discretization_steps
+            )
+            drift_norms.append(drift_norm)
+            
+            # Copy results back to original tensors
+            x[:, start_idx:end_idx] = x_chunk
+            xp[:, start_idx:end_idx] = xp_chunk
+        
+        return th.mean(th.cat(drift_norms))
+    else:
+        return euler_discretization_full_chunk(x, xp, nn, energy, discretization_steps)
+
+def euler_discretization_full_chunk(x, xp, nn, energy, discretization_steps):
+    """Original euler_discretization_full logic for a single chunk"""
+    T = discretization_steps
     B = x.shape[1]
     dt = th.full(size=(B,), fill_value=1.0 / T, device=x.device)
     drift_norms = 0.0
@@ -669,19 +702,30 @@ def run(
             te_loader_x_1 = te_loader_0
 
             def sample_dbfs_coupling(step):
-                if iteration == 1:
-                    x_0 = next(tr_iter_1).to(device)
-                    x_1 = next(tr_iter_0).to(device)
-                else:
-                    with th.no_grad():
-                        if (step - 1) % cache_steps == 0:
-                            if rank == 0:
-                                console.log(f"cache update: {step}")
-                            x_0 = next(tr_cache_iter_0).to(device)
-                            x_1, _ = euler_discretization_endpoints(
-                                x_0, fwd_sample_nn, sigma, discretization_steps
+                with th.no_grad():
+                    if (step - 1) % cache_steps == 0:
+                        if rank == 0:
+                            console.log(f"cache update: {step}")
+                        # Process in smaller batches to avoid memory issues
+                        batch_size = 32  # Smaller batch size for processing
+                        num_batches = cache_batch_dim // batch_size
+                        x_0_list = []
+                        x_1_list = []
+                        
+                        for i in range(num_batches):
+                            x_0_batch = next(tr_cache_iter_0).to(device)
+                            x_1_batch, _ = euler_discretization_endpoints(
+                                x_0_batch, fwd_sample_nn, sigma, discretization_steps
                             )
-                return x_0, x_1
+                            x_0_list.append(x_0_batch)
+                            x_1_list.append(x_1_batch)
+                        
+                        x_0 = th.cat(x_0_list, dim=0)
+                        x_1 = th.cat(x_1_list, dim=0)
+                        
+                    # Random selection from the cached tensors
+                    idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
+                    return x_0[idx], x_1[idx]
 
         else:
             nn = fwd_nn
@@ -697,6 +741,7 @@ def run(
                         if rank == 0:
                             console.log(f"cache update: {step}")
                         x_0 = next(tr_cache_iter_1).to(device)
+                        print("Shape of x_0: ", x_0.shape)
                         x_1, _ = euler_discretization_endpoints(
                             x_0, bwd_sample_nn, sigma, discretization_steps
                         )
@@ -908,12 +953,14 @@ def restore_checkpoint(saves, console):
 
 if __name__ == "__main__":
     config = {
-        "batch_dim": 128,  # Increased for better GPU utilization
-        "cache_batch_dim": 2560,  #
-        "cache_steps": 250,
-        "test_steps": 5000,  # More frequent evaluation
+        "batch_dim": 64,  # Increased for better GPU utilization
+        "cache_batch_dim": 1280,  #
+        # "cache_steps": 250,
+        "cache_steps": 2,
+        "test_steps": 4,  # More frequent evaluation
         "iterations": 30,
         "load": False,  # continue training
+        "training_steps": 4,
     }
 
     fire.Fire(run(**config))
