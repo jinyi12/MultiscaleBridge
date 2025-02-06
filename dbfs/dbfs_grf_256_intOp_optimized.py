@@ -656,9 +656,11 @@ def run(
         if rank == 0:
             progress.update(iteration_t, completed=iteration)
         # Setup:
-        if (iteration % 2) != 0:
-            # Odd iteration => bwd.
-            direction = "bwd"
+        direction = "bwd" if (iteration % 2) != 0 else "fwd"
+        if rank == 0:
+            console.log(f"Current direction: {direction}")
+
+        if direction == "bwd":
             nn = bwd_nn
             ema = bwd_ema
             sample_nn = bwd_sample_nn
@@ -682,8 +684,6 @@ def run(
                 return x_0, x_1
 
         else:
-            # Even iteration => fwd.
-            direction = "fwd"
             nn = fwd_nn
             ema = fwd_ema
             sample_nn = fwd_sample_nn
@@ -808,9 +808,16 @@ def run(
 
             if step % loss_log_steps == 0:
                 if rank == 0:
-                    wandb.log({f"{direction}/train/loss": loss.item()}, step=step)
-                if rank == 0:
-                    wandb.log({f"{direction}/train/grad_norm": grad_norm}, step=step)
+                    wandb.log(
+                        {
+                            f"{direction}/train/loss": loss.item(),
+                            f"{direction}/train/grad_norm": grad_norm,
+                            "current_direction": direction,
+                            "iteration": iteration,
+                            "step": step,
+                        },
+                        step=step,
+                    )
 
             if step % imge_log_steps == 0:
                 if rank == 0:
