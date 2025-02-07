@@ -166,123 +166,62 @@ def dbfs_target(x_t, x_1, t):
     return x_1
 
 
-def euler_discretization_endpoints(x_0, nn, energy, discretization_steps=30):
-    """
-    Simplified Euler discretization that only computes and returns the terminal state.
-    """
-    dt = 1.0 / discretization_steps
-    B = x_0.shape[0]
-    x_t = x_0
-
-    _, _, h, w = x_0.shape
-    freqs = np.pi * th.linspace(0, h - 1, h) / h
-    freq = (freqs[:, None] ** 2 + freqs[None, :] ** 2).to(x_0.device)
-    frequencies_squared = freq + 1.0
-    a_k = frequencies_squared[None, None]
-    sigma_k = th.pow(a_k, -0.01) / energy
-
-    drift_norms = 0.0
-
-    for i in range(1, discretization_steps + 1):
-        t = th.full(size=(B,), fill_value=dt * (i - 1), device=x_0.device)
-        print("Shape of t: ", t.shape)
-        print("Shape of x_t: ", x_t.shape)
-        alpha_t = nn(x_t, t)
-        drift_norms = drift_norms + th.mean(alpha_t.view(B, -1) ** 2, dim=1)
-
-        alpha_t = dct_2d(alpha_t, norm="ortho")
-        x_i = dct_2d(x_t, norm="ortho")
-        t_ = t[:, None, None, None]
-        t_end = th.ones_like(t_)
-
-        control = (a_(t_, t_end, a_k) * alpha_t - a_2(t_, t_end, a_k) * x_i) / v_(
-            t_, t_end, a_k
-        )
-        drift_t = (-a_k * x_i + control) * dt[:, None, None, None]
-
-        if i == discretization_steps:
-            diffusion_t = 0
-        else:
-            eps_t = dct_2d(th.randn_like(x_t), norm="ortho")
-            diffusion_t = sigma_k * th.sqrt(dt[:, None, None, None]) * eps_t
-
-        x_t = idct_2d(x_i + drift_t + diffusion_t, norm="ortho")
-
-    return x_t, drift_norms / discretization_steps
-
-
-def euler_discretization_full(x, xp, nn, energy, discretization_steps=30):
-    """
-    Full Euler discretization that returns the complete trajectory.
-    Processes data in smaller batches to avoid memory issues.
-    """
-    T = discretization_steps
-    batch_size = x.shape[1]
-    max_batch_size = 16  # Adjust based on GPU memory
-    
-    # Process in chunks if batch size is too large
-    if batch_size > max_batch_size:
-        num_chunks = (batch_size + max_batch_size - 1) // max_batch_size
-        drift_norms = []
-        
-        for i in range(num_chunks):
-            start_idx = i * max_batch_size
-            end_idx = min((i + 1) * max_batch_size, batch_size)
-            
-            x_chunk = x[:, start_idx:end_idx]
-            xp_chunk = xp[:, start_idx:end_idx]
-            
-            drift_norm = euler_discretization_full_chunk(
-                x_chunk, xp_chunk, nn, energy, discretization_steps
-            )
-            drift_norms.append(drift_norm)
-            
-            # Copy results back to original tensors
-            x[:, start_idx:end_idx] = x_chunk
-            xp[:, start_idx:end_idx] = xp_chunk
-        
-        return th.mean(th.cat(drift_norms))
-    else:
-        return euler_discretization_full_chunk(x, xp, nn, energy, discretization_steps)
-
-def euler_discretization_full_chunk(x, xp, nn, energy, discretization_steps):
-    """Original euler_discretization_full logic for a single chunk"""
-    T = discretization_steps
-    B = x.shape[1]
+def euler_discretization(x, xp, nn, energy, chunk_size=128):
+    # x has shape [T+1, cache_batch_dim, C, H, W]
+    T = x.shape[0] - 1  # number of discretization steps
+    B = x.shape[1]      # B = cache_batch_dim
     dt = th.full(size=(B,), fill_value=1.0 / T, device=x.device)
     drift_norms = 0.0
 
-    _, _, h, w = x[0].shape
+    _, b, c, h, w = x.shape
+
     freqs = np.pi * th.linspace(0, h - 1, h) / h
     freq = (freqs[:, None] ** 2 + freqs[None, :] ** 2).to(x.device)
     frequencies_squared = freq + 1.0
     a_k = frequencies_squared[None, None]
     sigma_k = th.pow(a_k, -0.01) / energy
-
+    
     for i in range(1, T + 1):
         t = dt * (i - 1)
-        alpha_t = nn(x[i - 1], t)
+        # Instead of processing the full cache at once, process in chunks:
+        alpha_chunks = []
+        # Split the batch dimension into sub-batches of size chunk_size:
+        for start in range(0, B, chunk_size):
+            end = min(start + chunk_size, B)
+            # Process a small chunk through the neural network:
+            alpha_chunk = nn(x[i - 1][start:end], t[start:end])
+            alpha_chunks.append(alpha_chunk)
+        # Concatenate the results along the batch dimension:
+        alpha_t = th.cat(alpha_chunks, dim=0)
         drift_norms = drift_norms + th.mean(alpha_t.view(B, -1) ** 2, dim=1)
+
+        # Continue with the rest of Euler discretization using alpha_t,
+        # Convert alpha_t to spectral domain:
         alpha_t = dct_2d(alpha_t, norm="ortho")
+        # Convert x[i-1] to spectral domain:
         x_i = dct_2d(x[i - 1], norm="ortho")
+        # (Compute drift, diffusion, etc.)
         t_ = t[:, None, None, None]
         t_end = th.ones_like(t_)
-        xp[i - 1] = idct_2d(alpha_t, norm="ortho")
-
+        xp_coeff = alpha_t
+        xp[i - 1] = idct_2d(xp_coeff, norm="ortho")
         control = (a_(t_, t_end, a_k) * alpha_t - a_2(t_, t_end, a_k) * x_i) / v_(
             t_, t_end, a_k
         )
         drift_t = (-a_k * x_i + control) * dt[:, None, None, None]
+        eps_t = dct_2d(th.randn_like(x[i - 1]), norm="ortho")
 
         if i == T:
             diffusion_t = 0
         else:
-            eps_t = dct_2d(th.randn_like(x[i - 1]), norm="ortho")
             diffusion_t = sigma_k * th.sqrt(dt[:, None, None, None]) * eps_t
-
+            
+        # Update x[i] accordingly
         x[i] = idct_2d(x_i + drift_t + diffusion_t, norm="ortho")
-
-    return drift_norms / T
+        
+        # Optionally compute and accumulate drift_norms as needed.
+    drift_norms = drift_norms / T
+    return drift_norms.cpu()
 
 
 # Data ---------------------------------------------------------------------------------
@@ -410,10 +349,6 @@ class DatasetDenormalization:
 # Create normalizers using only training data
 coarse_normalizer = DatasetNormalization("../Data/coarse_grf_10k.npy")
 fine_normalizer = DatasetNormalization("../Data/fine_grf_10k.npy")
-
-# Add these lines:
-denorm_fine = DatasetDenormalization(fine_normalizer.mean, fine_normalizer.std)
-denorm_coarse = DatasetDenormalization(coarse_normalizer.mean, coarse_normalizer.std)
 
 # Normalization transform
 transform_coarse = transforms.Compose([ToTensorCustom(), coarse_normalizer])
@@ -557,13 +492,36 @@ class EMAHelper:
 
 
 # Run ----------------------------------------------------------------------------------
+
+
+# def run(
+#     method=DBFS,
+#     sigma=1.0,
+#     # iterations=60,
+#     iterations=60,
+#     training_steps=5000,
+#     discretization_steps=30,
+#     batch_dim=32,
+#     learning_rate=1e-4,
+#     grad_max_norm=1.0,
+#     ema_decay=0.999,
+#     cache_steps=250,
+#     cache_batch_dim=2560,
+#     # test_steps=5000,
+#     test_steps=10,
+#     # test_batch_dim=512,
+#     test_batch_dim=32,
+#     loss_log_steps=100,
+#     imge_log_steps=1000,
+#     load=False,
+# ):
 def run(
     method=DBFS,
     sigma=1.0,
-    iterations=60,
-    training_steps=5000,
+    iterations=60,  # fewer iterations
+    training_steps=5000,  # fewer training steps
     discretization_steps=30,
-    batch_dim=128,
+    batch_dim=32,  # smaller batch size
     learning_rate=1e-4,
     grad_max_norm=1.0,
     ema_decay=0.999,
@@ -679,7 +637,15 @@ def run(
     dt = 1.0 / discretization_steps
     t_T = 1.0 - dt * 0.5
 
-    scaler = th.amp.GradScaler("cuda", enabled=True)
+    # Update image dimensions from 32x32 to 32x32
+    s_path = th.zeros(
+        size=(discretization_steps + 1,) + (cache_batch_dim, 1, 32, 32), device=device
+    )  # i: 0, ..., discretization_steps; t: 0, dt, ..., 1.0.
+    p_path = th.zeros(
+        size=(discretization_steps,) + (cache_batch_dim, 1, 32, 32), device=device
+    )  # i: 0, ..., discretization_steps - 1; t: 0, dt, ..., 1.0 - dt.
+
+    scaler = th.cuda.amp.GradScaler(enabled=True)
 
     if rank == 0:
         progress.start()
@@ -689,11 +655,9 @@ def run(
         if rank == 0:
             progress.update(iteration_t, completed=iteration)
         # Setup:
-        direction = "bwd" if (iteration % 2) != 0 else "fwd"
-        if rank == 0:
-            console.log(f"Current direction: {direction}")
-
-        if direction == "bwd":
+        if (iteration % 2) != 0:
+            # Odd iteration => bwd.
+            direction = "bwd"
             nn = bwd_nn
             ema = bwd_ema
             sample_nn = bwd_sample_nn
@@ -702,32 +666,28 @@ def run(
             te_loader_x_1 = te_loader_0
 
             def sample_dbfs_coupling(step):
-                with th.no_grad():
-                    if (step - 1) % cache_steps == 0:
-                        if rank == 0:
-                            console.log(f"cache update: {step}")
-                        # Process in smaller batches to avoid memory issues
-                        batch_size = 32  # Smaller batch size for processing
-                        num_batches = cache_batch_dim // batch_size
-                        x_0_list = []
-                        x_1_list = []
-                        
-                        for i in range(num_batches):
-                            x_0_batch = next(tr_cache_iter_0).to(device)
-                            x_1_batch, _ = euler_discretization_endpoints(
-                                x_0_batch, fwd_sample_nn, sigma, discretization_steps
-                            )
-                            x_0_list.append(x_0_batch)
-                            x_1_list.append(x_1_batch)
-                        
-                        x_0 = th.cat(x_0_list, dim=0)
-                        x_1 = th.cat(x_1_list, dim=0)
-                        
-                    # Random selection from the cached tensors
-                    idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
-                    return x_0[idx], x_1[idx]
+                if iteration == 1:
+                    # Independent coupling:
+                    x_0 = next(tr_iter_1).to(device)
+                    x_1 = next(tr_iter_0).to(device)
+                else:
+                    with th.no_grad():
+                        if (step - 1) % cache_steps == 0:
+                            if rank == 0:
+                                console.log(f"cache update: {step}")
+                            # Simulate previously inferred SDE:
+                            s_path[0] = next(tr_cache_iter_0).to(device)
+
+                            euler_discretization(s_path, p_path, fwd_sample_nn, sigma)
+                        # Random selection:
+                        idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
+                        # Reverse path:
+                        x_0, x_1 = s_path[-1, idx], s_path[0, idx]
+                return x_0, x_1
 
         else:
+            # Even iteration => fwd.
+            direction = "fwd"
             nn = fwd_nn
             ema = fwd_ema
             sample_nn = fwd_sample_nn
@@ -740,11 +700,14 @@ def run(
                     if (step - 1) % cache_steps == 0:
                         if rank == 0:
                             console.log(f"cache update: {step}")
-                        x_0 = next(tr_cache_iter_1).to(device)
-                        print("Shape of x_0: ", x_0.shape)
-                        x_1, _ = euler_discretization_endpoints(
-                            x_0, bwd_sample_nn, sigma, discretization_steps
-                        )
+                        # Simulate previously inferred SDE:
+                        s_path[0] = next(tr_cache_iter_1).to(device)
+
+                        euler_discretization(s_path, p_path, bwd_sample_nn, sigma)
+                    # Random selection:
+                    idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
+                    # Reverse path:
+                    x_0, x_1 = s_path[-1, idx], s_path[0, idx]
                 return x_0, x_1
 
         for step in range(step + 1, step + training_steps + 1):
@@ -752,8 +715,11 @@ def run(
             optim.zero_grad()
 
             x_0, x_1 = sample_dbfs_coupling(step)
+            # print("Shape of x_0: ", x_0.shape)
+            # print("Shape of x_1: ", x_1.shape)
             t = th.rand(size=(batch_dim,), device=device) * t_T
             x_t = sample_bridge(x_0, x_1, t, sigma)
+            # print("Shape of x_t: ", x_t.shape)
             target_t = dbfs_target(x_t, x_1, t)
 
             with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
@@ -786,6 +752,7 @@ def run(
             ema.update()
 
             if step % test_steps == 0:
+
                 if rank == 0:
                     console.log(f"test: {step}")
                 ema.ema(sample_nn)
@@ -803,13 +770,58 @@ def run(
                         size=(discretization_steps,) + (test_batch_dim, 1, 32, 32),
                         device=device,
                     )
+                    # Physical field so use L2 loss
+                    l2_losses = []
+
+                    drift_norm = []
+                    # console.log("Drift norm computation")
+                    # console.log("te_loader_x_0: ", len(te_loader_x_0))
+                    # console.log("te_loader_x_1: ", len(te_loader_x_1))
 
                     for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
-                        te_x_0 = te_x_0.to(device)
+                        # x_1 is coarse field if backward direction, fine field if forward direction
+                        # x_0 is fine field if backward direction, coarse field if forward direction
+                        te_x_0, te_x_1 = te_x_0.to(device), te_x_1.to(device)
                         te_s_path[0] = te_x_0
-                        drift_norm = euler_discretization_full(
-                            te_s_path, te_p_path, sample_nn, sigma, discretization_steps
+                        drift_norm.append(
+                            euler_discretization(te_s_path, te_p_path, sample_nn, sigma)
                         )
+
+                        # Compute L2 loss between generated field and target
+                        generated_field = te_s_path[-1]
+
+                        if direction == "fwd":
+                            # if forward, we want to coarsen the generated fine field
+                            # to calculate the L2 loss with the starting coarse field
+                            # to ensure the coarsen
+                            # field is of same regularity as the starting field
+                            target_field = te_x_0
+                            generated_field = coarsen_field(
+                                generated_field, downsample_factor=1
+                            )
+
+                            l2_loss = th.nn.functional.mse_loss(
+                                generated_field, target_field
+                            )
+                        else:
+                            # if backward, we want to compare the generated coarse field
+                            # with the target coarse field
+                            target_field = te_x_1
+                            l2_loss = th.nn.functional.mse_loss(
+                                generated_field, target_field
+                            )
+
+                        l2_losses.append(l2_loss.item())
+
+                    drift_norm = th.mean(th.cat(drift_norm)).item()
+                    mean_l2_loss = np.mean(l2_losses)
+
+                    denorm_fine = DatasetDenormalization(
+                        fine_normalizer.mean, fine_normalizer.std
+                    )
+                    denorm_coarse = DatasetDenormalization(
+                        coarse_normalizer.mean, coarse_normalizer.std
+                    )
 
                     if rank == 0:
                         wandb.log(
@@ -817,7 +829,15 @@ def run(
                         )
 
                     if rank == 0:
-                        console.log(f"mean L2 loss: {drift_norm}")
+                        wandb.log(
+                            {f"{direction}/test/drift_norm": drift_norm}, step=step
+                        )
+                    if rank == 0:
+                        wandb.log(
+                            {f"{direction}/test/l2_loss": mean_l2_loss}, step=step
+                        )
+                    if rank == 0:
+                        console.log(f"mean L2 loss: {mean_l2_loss}")
                     for i, ti in enumerate(
                         resample_indices(discretization_steps + 1, 5)
                     ):
@@ -851,18 +871,77 @@ def run(
                                 step=step,
                             )
 
+                # ########################### High Resolution ###########################
+                console.log("High Resolution")
+                with th.no_grad():
+                    te_s_path = th.zeros(
+                        size=(discretization_steps + 1,) + (test_batch_dim, 1, 64, 64),
+                        device=device,
+                    )
+                    te_p_path = th.zeros(
+                        size=(discretization_steps,) + (test_batch_dim, 1, 64, 64),
+                        device=device,
+                    )
+                    # Physical field, dont assume range of [0, 1]
+                    drift_norm = []
+
+                    denorm_fine = DatasetDenormalization(
+                        fine_normalizer.mean, fine_normalizer.std
+                    )
+                    denorm_coarse = DatasetDenormalization(
+                        coarse_normalizer.mean, coarse_normalizer.std
+                    )
+
+                    for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
+
+                        te_x_0 = F.resize(te_x_0, 64).to(device)
+                        te_x_1 = F.resize(te_x_1, 64).to(device)
+
+                        te_s_path[0] = te_x_0
+                        drift_norm.append(
+                            euler_discretization(te_s_path, te_p_path, sample_nn, sigma)
+                        )
+
+                        break
+
+                    for i, ti in enumerate(
+                        resample_indices(discretization_steps + 1, 5)
+                    ):
+                        if rank == 0:
+                            denorm_field = (
+                                denorm_fine(te_s_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_s_path[ti])
+                            )
+                            wandb.log(
+                                {
+                                    f"{direction}/test_32/x[{i}-{5}]": image_grid(
+                                        denorm_field
+                                    )
+                                },
+                                step=step,
+                            )
+                    for i, ti in enumerate(resample_indices(discretization_steps, 5)):
+                        if rank == 0:
+                            denorm_field = (
+                                denorm_fine(te_p_path[ti])
+                                if direction == "fwd"
+                                else denorm_coarse(te_p_path[ti])
+                            )
+                            wandb.log(
+                                {
+                                    f"{direction}/test_32/p[{i}-{5}]": image_grid(
+                                        denorm_field
+                                    )
+                                },
+                                step=step,
+                            )
+
             if step % loss_log_steps == 0:
                 if rank == 0:
-                    wandb.log(
-                        {
-                            f"{direction}/train/loss": loss.item(),
-                            f"{direction}/train/grad_norm": grad_norm,
-                            "current_direction": direction,
-                            "iteration": iteration,
-                            "step": step,
-                        },
-                        step=step,
-                    )
+                    wandb.log({f"{direction}/train/loss": loss.item()}, step=step)
+                if rank == 0:
+                    wandb.log({f"{direction}/train/grad_norm": grad_norm}, step=step)
 
             if step % imge_log_steps == 0:
                 if rank == 0:
@@ -954,13 +1033,12 @@ def restore_checkpoint(saves, console):
 if __name__ == "__main__":
     config = {
         "batch_dim": 64,  # Increased for better GPU utilization
-        "cache_batch_dim": 1280,  #
-        # "cache_steps": 250,
-        "cache_steps": 2,
-        "test_steps": 4,  # More frequent evaluation
+        "cache_batch_dim": 2560,  #
+        "cache_steps": 250,
+        "test_steps": 5000,  # More frequent evaluation
         "iterations": 30,
+        "training_steps": 5000,
         "load": False,  # continue training
-        "training_steps": 4,
     }
 
     fire.Fire(run(**config))
