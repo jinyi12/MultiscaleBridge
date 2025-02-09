@@ -518,10 +518,11 @@ class EMAHelper:
 def run(
     method=DBFS,
     sigma=1.0,
-    iterations=60,  # fewer iterations
-    training_steps=5000,  # fewer training steps
+    intOp_scale_factor=0.1,  # Add intOp_scale_factor parameter with default value
+    iterations=60,
+    training_steps=5000,
     discretization_steps=30,
-    batch_dim=32,  # smaller batch size
+    batch_dim=32,
     learning_rate=1e-4,
     grad_max_norm=1.0,
     ema_decay=0.999,
@@ -554,7 +555,12 @@ def run(
     step_t = progress.add_task("step", total=iterations * training_steps)
 
     if rank == 0:
-        wandb.init(project="dbfs", config=config, mode="online")
+        wandb.init(
+            project="dbfs", 
+            config=config, 
+            mode="online",
+            name=f"intOp_scale_factor_{intOp_scale_factor}"  # Add run name based on scale factor
+        )
     if rank == 0:
         console.log(wandb.config)
 
@@ -737,7 +743,7 @@ def run(
                         dim=1,
                     )
 
-                    losses = losses + 0.1 * losses_intOperator
+                    losses = losses +  intOp_scale_factor * losses_intOperator
 
                 loss = th.mean(losses)
 
@@ -939,7 +945,12 @@ def run(
 
             if step % loss_log_steps == 0:
                 if rank == 0:
-                    wandb.log({f"{direction}/train/loss": loss.item()}, step=step)
+                    wandb.log({
+                        f"{direction}/train/loss": loss.item(),
+                        f"{direction}/train/base_loss": losses.mean().item(),
+                        f"{direction}/train/operator_loss": losses_intOperator.mean().item() if direction == "bwd" else 0,
+                        f"{direction}/train/intOp_scale_factor": intOp_scale_factor
+                    }, step=step)
                 if rank == 0:
                     wandb.log({f"{direction}/train/grad_norm": grad_norm}, step=step)
 

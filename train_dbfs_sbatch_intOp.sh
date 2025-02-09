@@ -9,12 +9,15 @@
 #SBATCH --mail-type=BEGIN,END,FAIL     # Send email on job start, end, and fail
 #SBATCH --mail-user=jy384@duke.edu  # Email address to send notifications
 
+# Define scale factor (can be passed as argument to the script)
+SCALE_FACTOR=${1:-0.1}  # Default to 0.1 if not provided
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "Start time: $(date)"
 echo "Working directory: $(pwd)"
+echo "Scale Factor: $SCALE_FACTOR"
 
 # Print GPU information
 nvidia-smi
@@ -37,9 +40,9 @@ ls -l ../Data
 echo "Contents of Data directory:"
 ls -l ../Data/*.npy
 
-# Run Python script
+# Run your Python script
 echo "Starting training script..."
-python dbfs_grf_256_optimized.py 
+python dbfs_grf_256_intOp_optimized.py --intOp_scale_factor $SCALE_FACTOR
 
 # Print end time
 echo "End time: $(date)" 
