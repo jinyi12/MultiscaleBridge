@@ -7,6 +7,46 @@ from dbfs.dct import dct_2d, idct_2d
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchvision import transforms
+from torch.utils.data import Dataset
+
+
+class ToTensorCustom:
+    def __call__(self, array):
+        tensor = th.from_numpy(array).float()
+        # Add channel dimension if missing
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)  # Now tensor shape is (1, H, W)
+        return tensor
+
+
+class FieldsDataset(Dataset):
+    """Dataset for 2D fields (coarse or fine)"""
+
+    def __init__(self, data_path, train=True, transform=None):
+        # Load data from NumPy file
+        data = np.load(data_path)
+        n_samples = len(data)
+        n_train = int(0.8 * n_samples)
+
+        # Split into train/test sets
+        if train:
+            self.data = data[:n_train]
+        else:
+            self.data = data[n_train:]
+
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        field = self.data[idx]
+        if self.transform:
+            field = self.transform(field)
+        # Ensure field has shape (1, H, W)
+        assert field.dim() == 3, f"Expected field to be 3D, got {field.dim()}D"
+        return field
 
 
 class EMAHelper:
@@ -228,112 +268,230 @@ def load_forward_model(checkpoint_path, device):
     return fwd_sample_nn
 
 
-def load_and_prepare_coarse_field(npy_path, normalizer, device, batch_size=16):
+def load_coarse_fields(npy_path):
     all_fields = np.load(npy_path)
-    field = all_fields[0]  # Take first sample
-    field = th.from_numpy(field).float()
-    if field.dim() == 2:
-        field = field.unsqueeze(0)
+    return all_fields
 
-    # Normalize and upsample
-    field = normalizer(field)
-    field = upsample(field)
 
-    # Expand to batch
-    field_batch = field.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(device)
-    return field_batch, field
+def evaluate_convergence(
+    evaluation_point, sample_sizes, coarse_field, fwd_model, coarse_normalizer, device
+):
+    """
+    Evaluate convergence at a specific point for different sample sizes.
+
+    Args:
+        evaluation_point (tuple): (row, col) indices for evaluation
+        sample_sizes (list): List of different sample sizes to test
+        coarse_field (numpy.ndarray): Original coarse field (16x16)
+        fwd_model: Forward model for generation
+        coarse_normalizer: Normalizer for the coarse field
+        device: Computation device
+    """
+    # Get reference value at evaluation point from original coarse field
+    ref_value = coarse_field[evaluation_point]
+
+    convergence_results = {}
+
+    # Prepare normalized and upsampled field for model input
+    normalized_field = coarse_normalizer(coarse_field)
+    if normalized_field.dim() == 2:
+        normalized_field = normalized_field.unsqueeze(0)
+    upsampled_field = upsample(normalized_field)
+
+    for N in sample_sizes:
+        # Create batch of size N
+        coarse_batch = upsampled_field.unsqueeze(0).repeat(N, 1, 1, 1).to(device)
+
+        # Initialize paths for generation
+        discretization_steps = 30
+        sigma = 1.0
+        s_path = th.zeros((discretization_steps + 1, N, 1, 32, 32), device=device)
+        p_path = th.zeros((discretization_steps, N, 1, 32, 32), device=device)
+
+        # Set initial condition
+        s_path[0] = coarse_batch
+
+        # Generate samples
+        with th.no_grad():
+            euler_discretization(s_path, p_path, fwd_model, sigma)
+
+        generated_fine_fields = s_path[-1]
+
+        # Coarsen generated fields
+        coarsened_fields = []
+        for i in range(N):
+            coarsened = coarsen_field(
+                generated_fine_fields[i], filter_sigma=2.0, downsample_factor=2
+            )
+            # Denormalize
+            coarsened = coarse_normalizer.denormalize(coarsened.cpu())
+            coarsened_fields.append(coarsened.squeeze(0))
+
+        # Extract values at evaluation point
+        values = [cf[evaluation_point].item() for cf in coarsened_fields]
+
+        # Compute statistics
+        convergence_results[N] = {
+            "mean": np.mean(values),
+            "std": np.std(values),
+            "values": values,
+        }
+
+    return ref_value, convergence_results
+
+
+def plot_convergence(ref_value, convergence_results, checkpoint_name, save_dir):
+    """Plot convergence analysis results."""
+    sample_sizes = sorted(convergence_results.keys())
+    means = [convergence_results[N]["mean"] for N in sample_sizes]
+    stds = [convergence_results[N]["std"] for N in sample_sizes]
+
+    plt.figure(figsize=(10, 6))
+    plt.errorbar(sample_sizes, means, yerr=stds, fmt="o-", label="Sample Mean ± Std")
+    plt.axhline(y=ref_value, color="r", linestyle="--", label="Reference Value")
+
+    plt.xscale("log")
+    plt.xlabel("Number of Samples")
+    plt.ylabel("Field Value")
+    plt.title(f"Convergence Analysis - {checkpoint_name}")
+    plt.legend()
+    plt.grid(True)
+
+    # Save plot
+    plt.savefig(
+        f"{save_dir}/convergence_{checkpoint_name}.png", dpi=300, bbox_inches="tight"
+    )
+    plt.close()
 
 
 def main():
     # Setup
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
-    # without integral operator loss, and a scaled integral operator loss
+    # Define checkpoints to evaluate
     checkpoints = ["grf_10k_256_optimized.npz", "grf_10k_256_intOp_scaled.npz"]
+
+    # Define sample sizes for convergence analysis
+    sample_sizes = [10, 50, 100, 500, 1000]
+
+    # Define evaluation point (e.g., center point for 16x16 grid)
+    evaluation_point = (8, 8)
+
+    # Create output directory
+    output_dir = "evaluation_results"
+    os.makedirs(output_dir, exist_ok=True)
 
     for checkpoint in checkpoints:
         checkpoint_path = f"./dbfs/checkpoint/{checkpoint}"
-        coarse_data_path = f"./Data/coarse_grf_10k.npy"
+        coarse_data_path = "./Data/coarse_grf_10k.npy"
 
-    # Load normalizer
-    coarse_normalizer = DatasetNormalization(coarse_data_path)
+        # Load normalizer
+        coarse_normalizer = DatasetNormalization(coarse_data_path)
 
-    # Load model
-    fwd_model = load_forward_model(checkpoint_path, device)
+        # Load model
+        fwd_model = load_forward_model(checkpoint_path, device)
 
-    # Prepare input
-    batch_size = 16
-    coarse_field_batch, original_coarse = load_and_prepare_coarse_field(
-        coarse_data_path, coarse_normalizer, device, batch_size
-    )
+        # Create test dataset
+        transform_coarse = transforms.Compose([ToTensorCustom(), coarse_normalizer])
 
-    # Setup SDE parameters
-    discretization_steps = 30
-    sigma = 1.0
+        te_data_0 = FieldsDataset(
+            data_path=coarse_data_path, train=False, transform=transform_coarse
+        )
 
-    # Initialize paths
-    s_path = th.zeros((discretization_steps + 1, batch_size, 1, 32, 32), device=device)
-    p_path = th.zeros((discretization_steps, batch_size, 1, 32, 32), device=device)
+        # Get first test sample (original 16x16 field)
+        original_coarse = te_data_0.data[0]  # numpy array, 16x16
 
-    # Set initial condition
-    s_path[0] = coarse_field_batch
+        # Run convergence analysis on original coarse field
+        ref_value, convergence_results = evaluate_convergence(
+            evaluation_point,
+            sample_sizes,
+            original_coarse,
+            fwd_model,
+            coarse_normalizer,
+            device,
+        )
 
-    # Generate samples
-    with th.no_grad():
-        euler_discretization(s_path, p_path, fwd_model, sigma)
+        # Plot convergence results
+        plot_convergence(
+            ref_value, convergence_results, checkpoint.replace(".npz", ""), output_dir
+        )
 
-    generated_fine_fields = s_path[-1]
+        # For visualization, prepare normalized and upsampled field
+        normalized_field = coarse_normalizer(original_coarse)
+        if normalized_field.dim() == 2:
+            normalized_field = normalized_field.unsqueeze(0)
+        upsampled_field = upsample(normalized_field)
 
-    # Compute mean
-    mean_generated = generated_fine_fields.mean(dim=0)
+        # Generate visualization samples
+        batch_size = 16
+        coarse_field_batch = (
+            upsampled_field.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(device)
+        )
 
-    # Select and coarsen examples
-    num_examples = 3
-    coarsened_examples = []
-    for i in range(num_examples):
-        sample = generated_fine_fields[i]
-        coarsened = coarsen_field(sample, filter_sigma=2.0, downsample_factor=2)
-        # Denormalize
-        coarsened = coarse_normalizer.denormalize(coarsened.cpu())
-        coarsened_examples.append(coarsened.squeeze(0).numpy())
+        # Initialize paths
+        discretization_steps = 30
+        sigma = 1.0
+        s_path = th.zeros(
+            (discretization_steps + 1, batch_size, 1, 32, 32), device=device
+        )
+        p_path = th.zeros((discretization_steps, batch_size, 1, 32, 32), device=device)
 
-    # Process original and mean for plotting
-    original_coarse = (
-        coarse_normalizer.denormalize(original_coarse.cpu()).squeeze(0).numpy()
-    )
-    mean_generated = (
-        coarse_normalizer.denormalize(mean_generated.cpu()).squeeze(0).numpy()
-    )
+        # Set initial condition
+        s_path[0] = coarse_field_batch
 
-    # Plotting
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        # Generate samples
+        with th.no_grad():
+            euler_discretization(s_path, p_path, fwd_model, sigma)
 
-    # Plot original coarse field
-    im0 = axes[0].imshow(original_coarse, cmap="viridis")
-    axes[0].set_title("Original Coarse Field")
-    fig.colorbar(im0, ax=axes[0])
+        generated_fine_fields = s_path[-1]
 
-    # Plot mean of generated fine fields
-    im1 = axes[1].imshow(mean_generated, cmap="viridis")
-    axes[1].set_title("Mean Generated Fine Field")
-    fig.colorbar(im1, ax=axes[1])
+        # Compute mean
+        mean_generated = generated_fine_fields.mean(dim=0)
 
-    # Plot coarsened examples
-    for idx in range(num_examples):
-        im = axes[idx + 2].imshow(coarsened_examples[idx], cmap="viridis")
-        axes[idx + 2].set_title(f"Coarsened Sample {idx+1}")
-        fig.colorbar(im, ax=axes[idx + 2])
+        # Select and coarsen examples
+        num_examples = 3
+        coarsened_examples = []
+        for i in range(num_examples):
+            sample = generated_fine_fields[i]
+            coarsened = coarsen_field(sample, filter_sigma=2.0, downsample_factor=2)
+            coarsened = coarse_normalizer.denormalize(coarsened.cpu())
+            coarsened_examples.append(coarsened.squeeze(0).numpy())
 
-    plt.tight_layout()
+        # For plotting, use the original non-upsampled coarse field
+        original_coarse_np = original_coarse
+        mean_generated_np = (
+            coarse_normalizer.denormalize(mean_generated.cpu()).squeeze(0).numpy()
+        )
 
-    # Create output directory if it doesn't exist
-    os.makedirs("evaluation_results", exist_ok=True)
-    plt.savefig(
-        "evaluation_results/forward_generation_results.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close()
+        # Plotting
+        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+
+        # Plot original coarse field (16x16)
+        im0 = axes[0].imshow(original_coarse_np, cmap="viridis")
+        axes[0].set_title("Original Coarse Field")
+        fig.colorbar(im0, ax=axes[0])
+
+        # Plot mean of generated fine fields
+        im1 = axes[1].imshow(mean_generated_np, cmap="viridis")
+        axes[1].set_title("Mean Generated Fine Field")
+        fig.colorbar(im1, ax=axes[1])
+
+        # Plot coarsened examples
+        for idx in range(num_examples):
+            im = axes[idx + 2].imshow(coarsened_examples[idx], cmap="viridis")
+            axes[idx + 2].set_title(f"Coarsened Sample {idx+1}")
+            fig.colorbar(im, ax=axes[idx + 2])
+
+        plt.suptitle(f'Model: {checkpoint.replace(".npz", "")}')
+        plt.tight_layout()
+
+        # Save figure
+        plt.savefig(
+            f"{output_dir}/samples_{checkpoint.replace('.npz', '')}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
 
 
 if __name__ == "__main__":
