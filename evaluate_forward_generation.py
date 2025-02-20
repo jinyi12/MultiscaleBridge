@@ -388,6 +388,8 @@ def compute_field_l2_loss(
     Returns:
         mean_loss (float): The mean L2 loss computed over the n_samples.
         std_loss (float): The standard deviation of L2 losses.
+        mean_relative_loss (float): The mean relative L2 loss.
+        std_relative_loss (float): The standard deviation of relative L2 losses.
     """
     # Prepare normalized and upsampled field for model input
     normalized_field = coarse_normalizer(x0)
@@ -411,8 +413,12 @@ def compute_field_l2_loss(
 
     generated_fine_fields = s_path[-1]
 
+    # Compute original field norm for relative loss
+    x0_norm = th.norm(th.tensor(x0)).item()
+
     # Coarsen generated fields and compute losses
     losses = []
+    relative_losses = []
     for i in range(n_samples):
         # Coarsen the generated fine field
         coarsened = coarsen_field(
@@ -421,11 +427,20 @@ def compute_field_l2_loss(
         # Denormalize
         coarsened = coarse_normalizer.denormalize(coarsened.cpu())
 
-        # Compute L2 loss with original field
+        # Compute absolute L2 loss
         loss = th.norm(coarsened.squeeze(0) - th.tensor(x0)).item()
         losses.append(loss)
 
-    return np.mean(losses), np.std(losses)
+        # Compute relative L2 loss
+        relative_loss = loss / x0_norm
+        relative_losses.append(relative_loss)
+
+    return (
+        np.mean(losses),
+        np.std(losses),
+        np.mean(relative_losses),
+        np.std(relative_losses),
+    )
 
 
 def compute_mean_l2_loss_over_test_set(
@@ -444,30 +459,46 @@ def compute_mean_l2_loss_over_test_set(
     Returns:
         overall_mean_loss (float): Mean L2 loss averaged over the entire test set.
         overall_std_loss (float): Standard deviation of L2 losses over the test set.
-        per_field_results (list): List of (mean, std) tuples for each test field.
+        overall_mean_relative_loss (float): Mean relative L2 loss over the test set.
+        overall_std_relative_loss (float): Standard deviation of relative L2 losses.
+        per_field_results (list): List of (mean, std, rel_mean, rel_std) tuples for each test field.
     """
     per_field_results = []
 
     print(f"Computing L2 losses for {len(test_dataset)} test fields...")
-    for i in range(len(test_dataset)):
+    # draw 500 random fields from the test set
+    random_indices = np.random.choice(len(test_dataset), size=500, replace=False)
+    for i in random_indices:
         # Get original coarse field (without normalization/upsampling)
         x0 = test_dataset.data[i]
 
-        mean_loss, std_loss = compute_field_l2_loss(
+        mean_loss, std_loss, mean_rel_loss, std_rel_loss = compute_field_l2_loss(
             x0, fwd_model, coarse_normalizer, device, n_samples
         )
-        per_field_results.append((mean_loss, std_loss))
+        per_field_results.append((mean_loss, std_loss, mean_rel_loss, std_rel_loss))
 
         print(
-            f"Field {i+1}/{len(test_dataset)}: Mean L2 loss = {mean_loss:.4f} ± {std_loss:.4f}"
+            f"Field {i+1}/{len(test_dataset)}: "
+            f"Mean L2 loss = {mean_loss:.4f} ± {std_loss:.4f}, "
+            f"Mean Relative L2 loss = {mean_rel_loss:.4f} ± {std_rel_loss:.4f}"
         )
 
     # Compute overall statistics
     field_means = [r[0] for r in per_field_results]
+    field_rel_means = [r[2] for r in per_field_results]
+
     overall_mean_loss = np.mean(field_means)
     overall_std_loss = np.std(field_means)
+    overall_mean_relative_loss = np.mean(field_rel_means)
+    overall_std_relative_loss = np.std(field_rel_means)
 
-    return overall_mean_loss, overall_std_loss, per_field_results
+    return (
+        overall_mean_loss,
+        overall_std_loss,
+        overall_mean_relative_loss,
+        overall_std_relative_loss,
+        per_field_results,
+    )
 
 
 def main():
@@ -506,17 +537,26 @@ def main():
 
         # Compute L2 losses over test set
         print(f"\nEvaluating L2 losses for checkpoint: {checkpoint}")
-        overall_mean, overall_std, per_field_results = (
-            compute_mean_l2_loss_over_test_set(
-                te_data_0, fwd_model, coarse_normalizer, device
-            )
+        (
+            overall_mean,
+            overall_std,
+            overall_rel_mean,
+            overall_rel_std,
+            per_field_results,
+        ) = compute_mean_l2_loss_over_test_set(
+            te_data_0, fwd_model, coarse_normalizer, device
         )
-        print(f"Overall L2 loss: {overall_mean:.4f} ± {overall_std:.4f}")
+        print(
+            f"Overall L2 loss: {overall_mean:.4f} ± {overall_std:.4f}\n"
+            f"Overall Relative L2 loss: {overall_rel_mean:.4f} ± {overall_rel_std:.4f}"
+        )
 
         # Save L2 loss results
         results = {
             "overall_mean": overall_mean,
             "overall_std": overall_std,
+            "overall_relative_mean": overall_rel_mean,
+            "overall_relative_std": overall_rel_std,
             "per_field_results": per_field_results,
         }
         np.save(f"{output_dir}/l2_losses_{checkpoint.replace('.npz', '')}.npy", results)
