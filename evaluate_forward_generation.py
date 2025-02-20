@@ -103,7 +103,7 @@ def v_(s, t, a_k):
     return coeff * (1 - a_2(s, t, a_k))
 
 
-def euler_discretization(x, xp, nn, energy, chunk_size=128):
+def euler_discretization(x, xp, nn, energy, chunk_size=256):
     # x has shape [T+1, cache_batch_dim, C, H, W]
     T = x.shape[0] - 1  # number of discretization steps
     B = x.shape[1]  # B = cache_batch_dim
@@ -364,6 +364,112 @@ def plot_convergence(ref_value, convergence_results, checkpoint_name, save_dir):
     plt.close()
 
 
+def compute_field_l2_loss(
+    x0,
+    fwd_model,
+    coarse_normalizer,
+    device,
+    n_samples=500,
+    discretization_steps=30,
+    sigma=1.0,
+):
+    """
+    Compute the mean L2 loss between the original coarse field and the generated samples.
+
+    Parameters:
+        x0 (numpy.ndarray): The original coarse field (16x16).
+        fwd_model: The forward generation network (already in eval mode).
+        coarse_normalizer: Normalizer for the coarse field.
+        device: Torch device (CPU or GPU).
+        n_samples (int): Number of generation samples to draw (default: 500).
+        discretization_steps (int): Number of steps for Euler discretization (default: 30).
+        sigma (float): Energy parameter for generation (default: 1.0).
+
+    Returns:
+        mean_loss (float): The mean L2 loss computed over the n_samples.
+        std_loss (float): The standard deviation of L2 losses.
+    """
+    # Prepare normalized and upsampled field for model input
+    normalized_field = coarse_normalizer(x0)
+    if normalized_field.dim() == 2:
+        normalized_field = normalized_field.unsqueeze(0)
+    upsampled_field = upsample(normalized_field)
+
+    # Create batch of size n_samples
+    coarse_batch = upsampled_field.unsqueeze(0).repeat(n_samples, 1, 1, 1).to(device)
+
+    # Initialize paths for generation
+    s_path = th.zeros((discretization_steps + 1, n_samples, 1, 32, 32), device=device)
+    p_path = th.zeros((discretization_steps, n_samples, 1, 32, 32), device=device)
+
+    # Set initial condition
+    s_path[0] = coarse_batch
+
+    # Generate samples
+    with th.no_grad():
+        euler_discretization(s_path, p_path, fwd_model, sigma)
+
+    generated_fine_fields = s_path[-1]
+
+    # Coarsen generated fields and compute losses
+    losses = []
+    for i in range(n_samples):
+        # Coarsen the generated fine field
+        coarsened = coarsen_field(
+            generated_fine_fields[i], filter_sigma=2.0, downsample_factor=2
+        )
+        # Denormalize
+        coarsened = coarse_normalizer.denormalize(coarsened.cpu())
+
+        # Compute L2 loss with original field
+        loss = th.norm(coarsened.squeeze(0) - th.tensor(x0)).item()
+        losses.append(loss)
+
+    return np.mean(losses), np.std(losses)
+
+
+def compute_mean_l2_loss_over_test_set(
+    test_dataset, fwd_model, coarse_normalizer, device, n_samples=500
+):
+    """
+    Compute the overall mean L2 loss over all coarse fields in the test set.
+
+    Parameters:
+        test_dataset (FieldsDataset): Dataset of coarse fields.
+        fwd_model: The forward generation network.
+        coarse_normalizer: Normalizer for the coarse field.
+        device: Torch device.
+        n_samples (int): Number of generation samples per test field (default: 500).
+
+    Returns:
+        overall_mean_loss (float): Mean L2 loss averaged over the entire test set.
+        overall_std_loss (float): Standard deviation of L2 losses over the test set.
+        per_field_results (list): List of (mean, std) tuples for each test field.
+    """
+    per_field_results = []
+
+    print(f"Computing L2 losses for {len(test_dataset)} test fields...")
+    for i in range(len(test_dataset)):
+        # Get original coarse field (without normalization/upsampling)
+        x0 = test_dataset.data[i]
+
+        mean_loss, std_loss = compute_field_l2_loss(
+            x0, fwd_model, coarse_normalizer, device, n_samples
+        )
+        per_field_results.append((mean_loss, std_loss))
+
+        print(
+            f"Field {i+1}/{len(test_dataset)}: Mean L2 loss = {mean_loss:.4f} ± {std_loss:.4f}"
+        )
+
+    # Compute overall statistics
+    field_means = [r[0] for r in per_field_results]
+    overall_mean_loss = np.mean(field_means)
+    overall_std_loss = np.std(field_means)
+
+    return overall_mean_loss, overall_std_loss, per_field_results
+
+
 def main():
     # Setup
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
@@ -392,20 +498,34 @@ def main():
         fwd_model = load_forward_model(checkpoint_path, device)
 
         # Create test dataset
-        transform_coarse = transforms.Compose([ToTensorCustom(), coarse_normalizer])
-
         te_data_0 = FieldsDataset(
-            data_path=coarse_data_path, train=False, transform=transform_coarse
+            data_path=coarse_data_path,
+            train=False,
+            transform=None,  # No transform needed for L2 evaluation
         )
 
-        # Get first test sample (original 16x16 field)
-        original_coarse = te_data_0.data[0]  # numpy array, 16x16
+        # Compute L2 losses over test set
+        print(f"\nEvaluating L2 losses for checkpoint: {checkpoint}")
+        overall_mean, overall_std, per_field_results = (
+            compute_mean_l2_loss_over_test_set(
+                te_data_0, fwd_model, coarse_normalizer, device
+            )
+        )
+        print(f"Overall L2 loss: {overall_mean:.4f} ± {overall_std:.4f}")
+
+        # Save L2 loss results
+        results = {
+            "overall_mean": overall_mean,
+            "overall_std": overall_std,
+            "per_field_results": per_field_results,
+        }
+        np.save(f"{output_dir}/l2_losses_{checkpoint.replace('.npz', '')}.npy", results)
 
         # Run convergence analysis on original coarse field
         ref_value, convergence_results = evaluate_convergence(
             evaluation_point,
             sample_sizes,
-            original_coarse,
+            te_data_0.data[0],
             fwd_model,
             coarse_normalizer,
             device,
@@ -417,7 +537,7 @@ def main():
         )
 
         # For visualization, prepare normalized and upsampled field
-        normalized_field = coarse_normalizer(original_coarse)
+        normalized_field = coarse_normalizer(te_data_0.data[0])
         if normalized_field.dim() == 2:
             normalized_field = normalized_field.unsqueeze(0)
         upsampled_field = upsample(normalized_field)
@@ -458,7 +578,7 @@ def main():
             coarsened_examples.append(coarsened.squeeze(0).numpy())
 
         # For plotting, use the original non-upsampled coarse field
-        original_coarse_np = original_coarse
+        original_coarse_np = te_data_0.data[0]
         mean_generated_np = (
             coarse_normalizer.denormalize(mean_generated.cpu()).squeeze(0).numpy()
         )
