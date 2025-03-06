@@ -169,7 +169,7 @@ def dbfs_target(x_t, x_1, t):
 def euler_discretization(x, xp, nn, energy, chunk_size=128):
     # x has shape [T+1, cache_batch_dim, C, H, W]
     T = x.shape[0] - 1  # number of discretization steps
-    B = x.shape[1]      # B = cache_batch_dim
+    B = x.shape[1]  # B = cache_batch_dim
     dt = th.full(size=(B,), fill_value=1.0 / T, device=x.device)
     drift_norms = 0.0
 
@@ -180,7 +180,7 @@ def euler_discretization(x, xp, nn, energy, chunk_size=128):
     frequencies_squared = freq + 1.0
     a_k = frequencies_squared[None, None]
     sigma_k = th.pow(a_k, -0.01) / energy
-    
+
     for i in range(1, T + 1):
         t = dt * (i - 1)
         # Instead of processing the full cache at once, process in chunks:
@@ -215,10 +215,10 @@ def euler_discretization(x, xp, nn, energy, chunk_size=128):
             diffusion_t = 0
         else:
             diffusion_t = sigma_k * th.sqrt(dt[:, None, None, None]) * eps_t
-            
+
         # Update x[i] accordingly
         x[i] = idct_2d(x_i + drift_t + diffusion_t, norm="ortho")
-        
+
         # Optionally compute and accumulate drift_norms as needed.
     drift_norms = drift_norms / T
     return drift_norms.cpu()
@@ -556,10 +556,10 @@ def run(
 
     if rank == 0:
         wandb.init(
-            project="dbfs", 
-            config=config, 
+            project="dbfs",
+            config=config,
             mode="online",
-            name=f"intOp_scale_factor_{intOp_scale_factor}"  # Add run name based on scale factor
+            name=f"intOp_scale_factor_{intOp_scale_factor}",  # Add run name based on scale factor
         )
     if rank == 0:
         console.log(wandb.config)
@@ -720,6 +720,8 @@ def run(
             progress.update(step_t, completed=step)
             optim.zero_grad()
 
+            # for backward direction, x_1 is the coarse field (not from euler discretization), x_0 is the fine field (from euler discretization)
+            # for forward direction, x_0 is the coarse field (from euler discretization), x_1 is the fine field (not from euler discretization)
             x_0, x_1 = sample_dbfs_coupling(step)
             # print("Shape of x_0: ", x_0.shape)
             # print("Shape of x_1: ", x_1.shape)
@@ -734,6 +736,10 @@ def run(
                 losses = th.mean(losses.reshape(losses.shape[0], -1), dim=1)
 
                 if direction == "bwd":
+                    # target_t in backward direction is the coarse field
+                    # target_t is not obtained from the forward process, it is from the cache
+                    # x_0 in backward direction is the fine field
+                    # x_0 is obtained from euler discretization of the forward process under the control \alpha_t(;\theta)
                     losses_intOperator = (
                         target_t - coarsen_field(x_0, downsample_factor=1)
                     ) ** 2
@@ -743,7 +749,7 @@ def run(
                         dim=1,
                     )
 
-                    losses = losses +  intOp_scale_factor * losses_intOperator
+                    losses = losses + intOp_scale_factor * losses_intOperator
 
                 loss = th.mean(losses)
 
@@ -945,12 +951,19 @@ def run(
 
             if step % loss_log_steps == 0:
                 if rank == 0:
-                    wandb.log({
-                        f"{direction}/train/loss": loss.item(),
-                        f"{direction}/train/base_loss": losses.mean().item(),
-                        f"{direction}/train/operator_loss": losses_intOperator.mean().item() if direction == "bwd" else 0,
-                        f"{direction}/train/intOp_scale_factor": intOp_scale_factor
-                    }, step=step)
+                    wandb.log(
+                        {
+                            f"{direction}/train/loss": loss.item(),
+                            f"{direction}/train/base_loss": losses.mean().item(),
+                            f"{direction}/train/operator_loss": (
+                                losses_intOperator.mean().item()
+                                if direction == "bwd"
+                                else 0
+                            ),
+                            f"{direction}/train/intOp_scale_factor": intOp_scale_factor,
+                        },
+                        step=step,
+                    )
                 if rank == 0:
                     wandb.log({f"{direction}/train/grad_norm": grad_norm}, step=step)
 

@@ -501,6 +501,117 @@ def compute_mean_l2_loss_over_test_set(
     )
 
 
+def check_existing_evaluation(checkpoint_name, output_dir):
+    """Check if evaluation results already exist for the checkpoint."""
+    results_path = f"{output_dir}/l2_losses_{checkpoint_name}.npy"
+    if os.path.exists(results_path):
+        print(f"Found existing evaluation results for {checkpoint_name}")
+        return np.load(results_path, allow_pickle=True).item()
+    return None
+
+
+def plot_generation_samples(
+    original_coarse,
+    true_fine,
+    generated_fine_fields,
+    coarse_normalizer,
+    fine_normalizer,
+    checkpoint_name,
+    output_dir,
+    num_examples=3,
+):
+    """
+    Plot two figures:
+    1. Reference fields: Original coarse, true fine, mean generated fine, and mean coarsened
+    2. Generated samples: Fine fields and their coarsened counterparts
+    """
+    # Compute mean of generated fields
+    mean_generated = generated_fine_fields.mean(dim=0)
+    mean_generated_np = (
+        fine_normalizer.denormalize(mean_generated.cpu()).squeeze(0).numpy()
+    )
+
+    # Compute coarsened mean
+    coarsened_mean = (
+        coarsen_field(
+            th.tensor(mean_generated_np).unsqueeze(0),
+            filter_sigma=2.0,
+            downsample_factor=2,
+        )
+        .squeeze(0)
+        .numpy()
+    )
+
+    # Figure 1: Reference Fields
+    fig1, axes1 = plt.subplots(2, 2, figsize=(12, 12))
+
+    # Original coarse field
+    im0 = axes1[0, 0].imshow(original_coarse, cmap="viridis")
+    axes1[0, 0].set_title("Original Coarse Field")
+    fig1.colorbar(im0, ax=axes1[0, 0])
+
+    # True fine field
+    im1 = axes1[0, 1].imshow(true_fine, cmap="viridis")
+    axes1[0, 1].set_title("True Fine Field")
+    fig1.colorbar(im1, ax=axes1[0, 1])
+
+    # Mean generated fine field
+    im2 = axes1[1, 0].imshow(mean_generated_np, cmap="viridis")
+    axes1[1, 0].set_title("Mean Generated Fine Field")
+    fig1.colorbar(im2, ax=axes1[1, 0])
+
+    # Mean coarsened field
+    im3 = axes1[1, 1].imshow(coarsened_mean, cmap="viridis")
+    axes1[1, 1].set_title("Mean Coarsened Field")
+    fig1.colorbar(im3, ax=axes1[1, 1])
+
+    plt.suptitle(f"Reference Fields - Model: {checkpoint_name}")
+    plt.tight_layout()
+
+    # Save reference fields figure
+    plt.savefig(
+        f"{output_dir}/reference_fields_{checkpoint_name}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # Figure 2: Generated Samples
+    fig2, axes2 = plt.subplots(2, num_examples, figsize=(15, 8))
+
+    # Process and plot generated samples
+    for i in range(num_examples):
+        # Get and process fine sample
+        fine_sample = generated_fine_fields[i]
+        fine_sample = fine_normalizer.denormalize(fine_sample.cpu())
+        fine_np = fine_sample.squeeze(0).numpy()
+
+        # Get coarsened sample
+        coarsened = coarsen_field(fine_sample, filter_sigma=2.0, downsample_factor=2)
+        coarsened_np = coarsened.squeeze(0).numpy()
+
+        # Plot fine sample
+        im_fine = axes2[0, i].imshow(fine_np, cmap="viridis")
+        axes2[0, i].set_title(f"Generated Fine {i+1}")
+        fig2.colorbar(im_fine, ax=axes2[0, i])
+
+        # Plot coarsened sample
+        im_coarse = axes2[1, i].imshow(coarsened_np, cmap="viridis")
+        axes2[1, i].set_title(f"Coarsened {i+1}")
+        fig2.colorbar(im_coarse, ax=axes2[1, i])
+
+    plt.suptitle(f"Generated Samples - Model: {checkpoint_name}")
+    plt.tight_layout()
+
+    # Save generated samples figure
+    plt.savefig(
+        f"{output_dir}/generated_samples_{checkpoint_name}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
 def main():
     # Setup
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
@@ -508,87 +619,90 @@ def main():
     # Define checkpoints to evaluate
     checkpoints = ["grf_10k_256_optimized.npz", "grf_10k_256_intOp_scaled.npz"]
 
-    # Define sample sizes for convergence analysis
-    sample_sizes = [10, 50, 100, 500, 1000]
-
-    # Define evaluation point (e.g., center point for 16x16 grid)
-    evaluation_point = (8, 8)
-
     # Create output directory
     output_dir = "evaluation_results"
     os.makedirs(output_dir, exist_ok=True)
 
     for checkpoint in checkpoints:
+        checkpoint_name = checkpoint.replace(".npz", "")
         checkpoint_path = f"./dbfs/checkpoint/{checkpoint}"
         coarse_data_path = "./Data/coarse_grf_10k.npy"
+        fine_data_path = "./Data/fine_grf_10k.npy"
 
-        # Load normalizer
+        # Check for existing evaluation results
+        existing_results = check_existing_evaluation(checkpoint_name, output_dir)
+
+        if existing_results is None:
+            # Load normalizer and model
+            coarse_normalizer = DatasetNormalization(coarse_data_path)
+            fwd_model = load_forward_model(checkpoint_path, device)
+
+            # Create test dataset
+            te_data_0 = FieldsDataset(
+                data_path=coarse_data_path,
+                train=False,
+                transform=None,
+            )
+
+            # Compute L2 losses over test set
+            print(f"\nEvaluating L2 losses for checkpoint: {checkpoint}")
+            results = compute_mean_l2_loss_over_test_set(
+                te_data_0, fwd_model, coarse_normalizer, device
+            )
+
+            # Save results
+            (
+                overall_mean,
+                overall_std,
+                overall_rel_mean,
+                overall_rel_std,
+                per_field_results,
+            ) = results
+            results_dict = {
+                "overall_mean": overall_mean,
+                "overall_std": overall_std,
+                "overall_relative_mean": overall_rel_mean,
+                "overall_relative_std": overall_rel_std,
+                "per_field_results": per_field_results,
+            }
+            np.save(f"{output_dir}/l2_losses_{checkpoint_name}.npy", results_dict)
+        else:
+            results_dict = existing_results
+            print(f"\nUsing existing evaluation results for: {checkpoint}")
+
+        # Print results
+        print(
+            f"Overall L2 loss: {results_dict['overall_mean']:.4f} ± {results_dict['overall_std']:.4f}\n"
+            f"Overall Relative L2 loss: {results_dict['overall_relative_mean']:.4f} ± {results_dict['overall_relative_std']:.4f}"
+        )
+
+        # Generate visualization samples
         coarse_normalizer = DatasetNormalization(coarse_data_path)
-
-        # Load model
+        fine_normalizer = DatasetNormalization(fine_data_path)
         fwd_model = load_forward_model(checkpoint_path, device)
 
-        # Create test dataset
+        # Load test datasets
         te_data_0 = FieldsDataset(
-            data_path=coarse_data_path,
-            train=False,
-            transform=None,  # No transform needed for L2 evaluation
+            data_path=coarse_data_path, train=False, transform=None
         )
+        te_data_1 = FieldsDataset(data_path=fine_data_path, train=False, transform=None)
 
-        # Compute L2 losses over test set
-        print(f"\nEvaluating L2 losses for checkpoint: {checkpoint}")
-        (
-            overall_mean,
-            overall_std,
-            overall_rel_mean,
-            overall_rel_std,
-            per_field_results,
-        ) = compute_mean_l2_loss_over_test_set(
-            te_data_0, fwd_model, coarse_normalizer, device
-        )
-        print(
-            f"Overall L2 loss: {overall_mean:.4f} ± {overall_std:.4f}\n"
-            f"Overall Relative L2 loss: {overall_rel_mean:.4f} ± {overall_rel_std:.4f}"
-        )
+        # Get corresponding coarse and fine fields
+        original_coarse = te_data_0.data[0]
+        true_fine = te_data_1.data[0]
 
-        # Save L2 loss results
-        results = {
-            "overall_mean": overall_mean,
-            "overall_std": overall_std,
-            "overall_relative_mean": overall_rel_mean,
-            "overall_relative_std": overall_rel_std,
-            "per_field_results": per_field_results,
-        }
-        np.save(f"{output_dir}/l2_losses_{checkpoint.replace('.npz', '')}.npy", results)
-
-        # Run convergence analysis on original coarse field
-        ref_value, convergence_results = evaluate_convergence(
-            evaluation_point,
-            sample_sizes,
-            te_data_0.data[0],
-            fwd_model,
-            coarse_normalizer,
-            device,
-        )
-
-        # Plot convergence results
-        plot_convergence(
-            ref_value, convergence_results, checkpoint.replace(".npz", ""), output_dir
-        )
-
-        # For visualization, prepare normalized and upsampled field
-        normalized_field = coarse_normalizer(te_data_0.data[0])
+        # Prepare input for generation
+        normalized_field = coarse_normalizer(original_coarse)
         if normalized_field.dim() == 2:
             normalized_field = normalized_field.unsqueeze(0)
         upsampled_field = upsample(normalized_field)
 
-        # Generate visualization samples
+        # Generate samples
         batch_size = 16
         coarse_field_batch = (
             upsampled_field.unsqueeze(0).repeat(batch_size, 1, 1, 1).to(device)
         )
 
-        # Initialize paths
         discretization_steps = 30
         sigma = 1.0
         s_path = th.zeros(
@@ -596,62 +710,23 @@ def main():
         )
         p_path = th.zeros((discretization_steps, batch_size, 1, 32, 32), device=device)
 
-        # Set initial condition
         s_path[0] = coarse_field_batch
 
-        # Generate samples
         with th.no_grad():
             euler_discretization(s_path, p_path, fwd_model, sigma)
 
         generated_fine_fields = s_path[-1]
 
-        # Compute mean
-        mean_generated = generated_fine_fields.mean(dim=0)
-
-        # Select and coarsen examples
-        num_examples = 3
-        coarsened_examples = []
-        for i in range(num_examples):
-            sample = generated_fine_fields[i]
-            coarsened = coarsen_field(sample, filter_sigma=2.0, downsample_factor=2)
-            coarsened = coarse_normalizer.denormalize(coarsened.cpu())
-            coarsened_examples.append(coarsened.squeeze(0).numpy())
-
-        # For plotting, use the original non-upsampled coarse field
-        original_coarse_np = te_data_0.data[0]
-        mean_generated_np = (
-            coarse_normalizer.denormalize(mean_generated.cpu()).squeeze(0).numpy()
+        # Plot samples with true fine field
+        plot_generation_samples(
+            original_coarse,
+            true_fine,
+            generated_fine_fields,
+            coarse_normalizer,
+            fine_normalizer,
+            checkpoint_name,
+            output_dir,
         )
-
-        # Plotting
-        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-
-        # Plot original coarse field (16x16)
-        im0 = axes[0].imshow(original_coarse_np, cmap="viridis")
-        axes[0].set_title("Original Coarse Field")
-        fig.colorbar(im0, ax=axes[0])
-
-        # Plot mean of generated fine fields
-        im1 = axes[1].imshow(mean_generated_np, cmap="viridis")
-        axes[1].set_title("Mean Generated Fine Field")
-        fig.colorbar(im1, ax=axes[1])
-
-        # Plot coarsened examples
-        for idx in range(num_examples):
-            im = axes[idx + 2].imshow(coarsened_examples[idx], cmap="viridis")
-            axes[idx + 2].set_title(f"Coarsened Sample {idx+1}")
-            fig.colorbar(im, ax=axes[idx + 2])
-
-        plt.suptitle(f'Model: {checkpoint.replace(".npz", "")}')
-        plt.tight_layout()
-
-        # Save figure
-        plt.savefig(
-            f"{output_dir}/samples_{checkpoint.replace('.npz', '')}.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close()
 
 
 if __name__ == "__main__":
