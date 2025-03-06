@@ -42,12 +42,14 @@ data_path = os.path.expanduser("~/torch-data/")
 
 # DDP
 if th.cuda.is_available() and th.cuda.device_count() > 1:
+    print("Initializing DDP")
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = th.device(f"cuda:{rank}") if th.cuda.is_available() else th.device("cpu")
     parallel = True
 else:
+    print("Not initializing DDP")
     device = th.device("cuda") if th.cuda.is_available() else th.device("cpu")
     rank = 0
     world_size = 1
@@ -577,6 +579,10 @@ def run(
     device = "cuda" if th.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Initialize wandb with a different project (only on rank 0 if using DDP)
+    if rank == 0:
+        wandb.init(project="BM2_GRF_MultiscaleBridge", config=config)
+
     # Setup data:
     tr_loader_0 = train_iter(tr_data_0, batch_dim)
     tr_iter_0 = iter(tr_loader_0)
@@ -657,11 +663,17 @@ def run(
 
                 # Forward pass
                 x_t_forward = sample_bridge(x_0, x_1, t, sigma)
-                fwd_target_t = fwd_target(x_t_forward, x_1, t)
+                # fwd_target_t = fwd_target(x_t_forward, x_1, t)
+                fwd_target_t = fwd_target(
+                    x_t_forward, x_1, t=None
+                )  # use DBFS formulation
 
                 # Backward pass
                 x_t_backward = sample_bridge(x_0, x_1, t, sigma)
-                bwd_target_t = bwd_target(x_t_backward, x_0, t)
+                # bwd_target_t = bwd_target(x_t_backward, x_0, t)
+                bwd_target_t = bwd_target(
+                    x_t_backward, x_0, t=None
+                )  # use DBFS formulation
 
                 with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
                     # Predict both forward and backward drifts with the same network
