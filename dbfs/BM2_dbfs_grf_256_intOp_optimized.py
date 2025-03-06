@@ -472,45 +472,22 @@ def init_nn():
 # Modified version for BM² that supports both forward and backward directions
 def init_bm2_nn():
     """Initialize a neural network for BM² that can handle both forward and backward directions.
-    This is a modified version of the original OperatorTransformer that takes a direction flag.
+    This version uses the dedicated BM2Transformer model with separate output heads.
     """
+    from dbfs.models.bm2_transformer import init_bm2_model
 
-    class BM2OperatorTransformer(OperatorTransformer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # Add a small embedding for the direction (forward or backward)
-            self.direction_embedding = th.nn.Embedding(2, kwargs.get("latent_dim", 256))
-
-        def forward(self, x, t, direction="fwd"):
-            # Original implementation processes x and t
-            # Add direction as a conditioning signal
-            dir_idx = 0 if direction == "fwd" else 1
-            dir_idx = th.tensor([dir_idx] * x.shape[0], device=x.device)
-            dir_emb = self.direction_embedding(dir_idx)
-
-            # Process as in the original implementation
-            result = super().forward(x, t)
-
-            # Add direction embedding influence to the result
-            # This is a simple way to condition the output on the direction
-            # More sophisticated approaches could be used
-            dir_emb = dir_emb.view(dir_emb.shape[0], dir_emb.shape[1], 1, 1)
-            dir_influence = th.nn.functional.adaptive_avg_pool2d(result, 1) * 0.1
-            result = result + dir_emb * dir_influence
-
-            return result
-
-    return BM2OperatorTransformer(
+    return init_bm2_model(
         in_channel=2,
         out_channel=1,
-        latent_dim=256,
         pos_dim=256,
+        latent_dim=256,
         num_heads=4,
         depth_enc=6,
         depth_dec=2,
         scale=1,
         self_per_cross_attn=1,
         height=256,  # to match the fine fields
+        dim=2,  # 2D data
     )
 
 
