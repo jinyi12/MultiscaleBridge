@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange, repeat
 
-from .transformer_flash_attention import (
+from models.transformer_flash_attention import (
     OperatorTransformer,
+    OperatorTransformer_1d,
     FinalLayer,
     make_grid,
     positionalencoding1d,
@@ -99,13 +100,16 @@ class BM2Transformer(OperatorTransformer):
         Returns:
             output: Processed output tensor of shape [batch_size, out_channels, height, width]
         """
+        # Rearrange input data to have channels as the last dimension
+        data = rearrange(data, "b c h w -> b h w c")
+
+        b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
+
         # Convert direction to tensor indices
         dir_idx = 0 if direction == "fwd" else 1
         dir_idx = torch.tensor([dir_idx] * t.shape[0], device=t.device)
         dir_emb = self.direction_embedding(dir_idx)
 
-        # Rearrange input data to have channels as the last dimension
-        data = rearrange(data, "b c h w -> b h w c")
         latent_dim = self.hidden_size
 
         # Step 1: Generate timestep embeddings with direction conditioning
@@ -118,83 +122,69 @@ class BM2Transformer(OperatorTransformer):
 
         # Step 2: Generate or use provided position encodings
         if input_pos is None:
-            rel_pos = make_grid((h, w)).to(device)
-            inp_pos = rearrange(rel_pos, "h w c -> (h w) c").repeat(batch_size, 1, 1)
+            grid = make_grid(axis[0])
+            grid = repeat(grid, "b hw c -> (repeat b) hw c", repeat=b)
+            grid = grid.to(data.device)
+            input_pos = output_pos = self.gfft(grid)
         else:
-            inp_pos = input_pos
-            rel_pos = None
+            raise NotImplementedError("Not implemented")
 
-        # Step 3: Apply Gaussian Fourier Feature Transform to positions
-        context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
-        context = rearrange(context, "(b n) c -> b n c", b=batch_size)
+        # # Step 3: Apply Gaussian Fourier Feature Transform to positions
+        # context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
+        # context = rearrange(context, "(b n) c -> b n c", b=batch_size)
+        context = input_pos
 
-        # Step 4: Concatenate position features with input data
-        proj_context = []
-        proj_context.append(data)
-        combined_context = torch.concat([context] + proj_context, dim=-1)
+        # Step 4: Combine positional encoding with projected input data
+        flattened_data = rearrange(data, "b ... c -> b (...) c")
+        input_emb = self.x_embedder(flattened_data) + context
 
-        # Step 5: Project combined context to expected hidden dimension
-        context = self.context_projection(combined_context)
+        # Step 5: Generate query embeddings with direction conditioning
+        queries = self.query_embedder(output_pos, t_emb)
 
-        # Step 6: Generate query embeddings with direction conditioning
-        queries = self.query_embedder(inp_pos, t_emb)
+        # Step 6: make repeated random latents
+        x = repeat(self.latents, "n d -> b n d", b=b)
+        c = t_emb
 
         # Step 7: Process through transformer blocks with optional checkpointing
         use_checkpointing = self.training and torch.is_grad_enabled()
 
-        for i, block in enumerate(self.decoder_blocks):
-            if isinstance(
-                block, nn.Module
-            ):  # Basic check to ensure it's a valid module
-                if hasattr(
-                    block, "forward_impl"
-                ):  # Custom naming for modules with special forward implementations
-                    if use_checkpointing:
-                        queries = torch.utils.checkpoint.checkpoint(
-                            self.ckpt_wrapper(block),
-                            queries,
-                            context if hasattr(block, "cross_attn") else None,
-                            t_emb,
-                            use_reentrant=False,
-                        )
-                    else:
-                        if hasattr(block, "cross_attn"):
-                            queries = block(queries, context, t_emb)
-                        else:
-                            queries = block(queries, t_emb)
-                else:  # Default handling
-                    if use_checkpointing:
-                        if (
-                            len(block._forward_pre_hooks) + len(block._forward_hooks)
-                            > 0
-                        ):
-                            # Handle modules with hooks differently
-                            queries = (
-                                block(queries, context, t_emb)
-                                if "context" in block.forward.__code__.co_varnames
-                                else block(queries, t_emb)
-                            )
-                        else:
-                            if "context" in block.forward.__code__.co_varnames:
-                                queries = torch.utils.checkpoint.checkpoint(
-                                    self.ckpt_wrapper(block),
-                                    queries,
-                                    context,
-                                    t_emb,
-                                    use_reentrant=False,
-                                )
-                            else:
-                                queries = torch.utils.checkpoint.checkpoint(
-                                    self.ckpt_wrapper(block),
-                                    queries,
-                                    t_emb,
-                                    use_reentrant=False,
-                                )
-                    else:
-                        if "context" in block.forward.__code__.co_varnames:
-                            queries = block(queries, context, t_emb)
-                        else:
-                            queries = block(queries, t_emb)
+        # Process through encoder blocks
+        for block in self.enc_block:
+            cross_attn, attns = block[0], block[-1]
+            x = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), x, input_emb, c
+                )
+                if self.training
+                else cross_attn(x, input_emb, c)
+            )
+
+            for l in range(len(attns)):
+                x = (
+                    torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(attns[l]), x, c)
+                    if self.training
+                    else attns[l](x, c)
+                )
+
+        # Process through decoder blocks
+        for block in self.dec_block:
+            cross_attn, attns = block[0], block[-1]
+            queries = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), queries, x, c
+                )
+                if self.training
+                else cross_attn(queries, x, c)
+            )
+
+            for l in range(len(attns)):
+                queries = (
+                    torch.utils.checkpoint.checkpoint(
+                        self.ckpt_wrapper(attns[l]), queries, c
+                    )
+                    if self.training
+                    else attns[l](queries, c)
+                )
 
         # Step 8: Generate final output through the appropriate head based on direction
         if direction == "fwd":
@@ -207,11 +197,15 @@ class BM2Transformer(OperatorTransformer):
         return z_out
 
 
-class BM2Transformer1D(OperatorTransformer):
+class BM2Transformer1D(OperatorTransformer_1d):
     """
     BM2Transformer1D: A 1D version of the BM2Transformer for handling 1D data sequences.
 
-    This is similar to the BM2Transformer but adapted for 1D data.
+    This model extends OperatorTransformer_1d to support direction conditioning
+    (forward/backward) by injecting an additional learned direction embedding into
+    the timestep embeddings. The backbone logic (input embedding, positional encoding,
+    encoder/decoder processing, and final projection) is identical to that of
+    OperatorTransformer_1d in transformer.py, ensuring consistency in the data flow.
     """
 
     def __init__(
@@ -231,16 +225,16 @@ class BM2Transformer1D(OperatorTransformer):
         Initialize the BM2Transformer1D model.
 
         Args:
-            in_channel: Number of input channels
-            out_channel: Number of output channels
-            pos_dim: Dimension of positional encodings
-            latent_dim: Dimension of latent representations
-            num_heads: Number of attention heads
-            depth_enc: Depth of encoder (unused but kept for compatibility)
-            depth_dec: Depth of decoder
-            scale: Scale parameter for Gaussian Fourier features
-            self_per_cross_attn: Number of self-attention blocks per cross-attention block
-            height: Length of the sequence
+            in_channel: Number of input channels.
+            out_channel: Number of output channels.
+            pos_dim: Dimension of positional encodings.
+            latent_dim: Dimension of latent representations.
+            num_heads: Number of attention heads.
+            depth_enc: Depth of encoder.
+            depth_dec: Depth of decoder.
+            scale: (Unused) Scale parameter.
+            self_per_cross_attn: Number of self-attention blocks per cross-attention block.
+            height: Length of the sequence (used for positional encoding).
         """
         super().__init__(
             in_channel,
@@ -255,20 +249,21 @@ class BM2Transformer1D(OperatorTransformer):
             height,
         )
 
-        # Add direction embedding
+        # --- Direction Conditioning ---
+        # Add a direction embedding to distinguish forward ("fwd") and backward ("bwd") directions.
         self.direction_embedding = nn.Embedding(2, latent_dim)
 
-        # Create separate output heads for forward and backward directions
-        # Keep the original final_layer as the forward head for compatibility
+        # Create separate final output heads for forward and backward directions.
+        # The forward head is kept identical to the parent's final_layer for compatibility.
         self.forward_head = self.final_layer
         self.backward_head = FinalLayer(latent_dim, out_channel)
 
-        # Initialize the direction embedding and backward head
+        # Initialize the direction embedding and backward head.
         nn.init.normal_(self.direction_embedding.weight, std=0.02)
         self._initialize_backward_head()
 
     def _initialize_backward_head(self):
-        """Initialize the backward head with the same initialization as the forward head"""
+        """Initialize the backward head with the same initialization as the forward head."""
         nn.init.constant_(self.backward_head.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.backward_head.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.backward_head.linear.weight, 0)
@@ -279,114 +274,90 @@ class BM2Transformer1D(OperatorTransformer):
         Forward pass through the BM2Transformer1D.
 
         Args:
-            data: Input tensor of shape [batch_size, channels, sequence_length]
-            t: Time step tensor of shape [batch_size]
-            direction: Direction flag, either "fwd" or "bwd"
-            input_pos: Optional input positions, if None, uses a generated grid
-            output_pos: Optional output positions (unused in this implementation)
+            data: Input tensor of shape [batch_size, channels, sequence_length].
+            t: Time step tensor of shape [batch_size].
+            direction: String flag ("fwd" or "bwd") for forward or backward diffusion.
+            input_pos: Optional input positions (unused; positional encodings are generated internally).
+            output_pos: Optional output positions (ignored if not provided).
 
         Returns:
-            output: Processed output tensor of shape [batch_size, out_channels, sequence_length]
+            z_out: Output tensor of shape [batch_size, out_channels, sequence_length].
         """
-        # Convert direction to tensor indices
+        # Convert direction flag to tensor indices and embed:
         dir_idx = 0 if direction == "fwd" else 1
         dir_idx = torch.tensor([dir_idx] * t.shape[0], device=t.device)
         dir_emb = self.direction_embedding(dir_idx)
 
-        # Rearrange input data to have channels as the last dimension
+        # Rearrange input data to have channels as the last dimension.
         data = rearrange(data, "b c l -> b l c")
-        latent_dim = self.hidden_size
+        batch_size, seq_length, _ = data.shape
 
-        # Step 1: Generate timestep embeddings with direction conditioning
+        latent_dim = self.hidden_size  # latent_dim
+
+        # Step 1: Generate timestep embeddings with directional conditioning.
         t_emb_base = self.time_embedder(t)
-        # Add direction information to timestep embedding
         t_emb = t_emb_base + dir_emb
 
-        batch_size, seq_len, data_chans = data.shape
-        device = data.device
+        # Step 2: Create 1D positional encodings.
+        pe = positionalencoding1d(latent_dim, seq_length).to(data.device)
+        # The positional encoding is repeated across the batch.
+        position_encodings = rearrange(pe, "n d -> 1 n d").repeat(batch_size, 1, 1)
 
-        # Step 2: Generate or use provided position encodings (1D in this case)
-        if input_pos is None:
-            # For 1D, we use standard positional encoding
-            pos_encoding = positionalencoding1d(latent_dim, seq_len).to(device)
-            inp_pos = pos_encoding.unsqueeze(0).repeat(batch_size, 1, 1)
-        else:
-            inp_pos = input_pos
+        # Step 3: Combine input data with positional encoding.
+        # The x_embedder projects the input data to the latent dimension.
+        input_emb = self.x_embedder(data) + position_encodings
 
-        # Step 3: Apply Gaussian Fourier Feature Transform to positions
-        context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
-        context = rearrange(context, "(b n) c -> b n c", b=batch_size)
+        # Step 4: (Optional) For the 1D backbone in transformer.py the queries are usually created
+        # by simply cloning the input embeddings. (In some variants, self.q_embedder is used.)
+        queries = input_emb.clone()
 
-        # Step 4: Concatenate position features with input data
-        proj_context = []
-        proj_context.append(data)
-        combined_context = torch.concat([context] + proj_context, dim=-1)
+        # Step 5: Initialize latent representation.
+        x = repeat(self.latents, "n d -> b n d", b=batch_size)
+        c = t_emb
 
-        # Step 5: Project combined context to expected hidden dimension
-        context = self.context_projection(combined_context)
+        # Step 6: Process through encoder blocks.
+        for block in self.enc_block:
+            cross_attn, attns = block[0], block[-1]
+            x = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), x, input_emb, c
+                )
+                if self.training
+                else cross_attn(x, input_emb, c)
+            )
+            for attn in attns:
+                x = (
+                    torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(attn), x, c)
+                    if self.training
+                    else attn(x, c)
+                )
 
-        # Step 6: Generate query embeddings with direction conditioning
-        queries = self.query_embedder(inp_pos, t_emb)
+        # Step 7: Process through decoder blocks.
+        for block in self.dec_block:
+            cross_attn, attns = block[0], block[-1]
+            queries = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), queries, x, c
+                )
+                if self.training
+                else cross_attn(queries, x, c)
+            )
+            for attn in attns:
+                queries = (
+                    torch.utils.checkpoint.checkpoint(
+                        self.ckpt_wrapper(attn), queries, c
+                    )
+                    if self.training
+                    else attn(queries, c)
+                )
 
-        # Step 7: Process through transformer blocks with optional checkpointing
-        use_checkpointing = self.training and torch.is_grad_enabled()
-
-        for i, block in enumerate(self.decoder_blocks):
-            if isinstance(block, nn.Module):
-                if hasattr(block, "forward_impl"):
-                    if use_checkpointing:
-                        queries = torch.utils.checkpoint.checkpoint(
-                            self.ckpt_wrapper(block),
-                            queries,
-                            context if hasattr(block, "cross_attn") else None,
-                            t_emb,
-                            use_reentrant=False,
-                        )
-                    else:
-                        if hasattr(block, "cross_attn"):
-                            queries = block(queries, context, t_emb)
-                        else:
-                            queries = block(queries, t_emb)
-                else:
-                    if use_checkpointing:
-                        if (
-                            len(block._forward_pre_hooks) + len(block._forward_hooks)
-                            > 0
-                        ):
-                            queries = (
-                                block(queries, context, t_emb)
-                                if "context" in block.forward.__code__.co_varnames
-                                else block(queries, t_emb)
-                            )
-                        else:
-                            if "context" in block.forward.__code__.co_varnames:
-                                queries = torch.utils.checkpoint.checkpoint(
-                                    self.ckpt_wrapper(block),
-                                    queries,
-                                    context,
-                                    t_emb,
-                                    use_reentrant=False,
-                                )
-                            else:
-                                queries = torch.utils.checkpoint.checkpoint(
-                                    self.ckpt_wrapper(block),
-                                    queries,
-                                    t_emb,
-                                    use_reentrant=False,
-                                )
-                    else:
-                        if "context" in block.forward.__code__.co_varnames:
-                            queries = block(queries, context, t_emb)
-                        else:
-                            queries = block(queries, t_emb)
-
-        # Step 8: Generate final output through the appropriate head based on direction
+        # Step 8: Compute final output through the appropriate head.
         if direction == "fwd":
             z = self.forward_head(queries, t_emb)
         else:
             z = self.backward_head(queries, t_emb)
 
-        # Reshape output to expected format [batch, channels, sequence_length]
+        # Step 9: Rearrange output to shape [batch, channels, sequence_length] and return.
         z_out = rearrange(z, "b l c -> b c l")
         return z_out
 

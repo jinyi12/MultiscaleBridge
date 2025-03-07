@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from functools import wraps
 import numpy as np
-from einops import rearrange
+from einops import rearrange, repeat
 from torch.amp import autocast, GradScaler
 
 
@@ -35,11 +35,11 @@ def cache_fn(f):
 
 
 def make_grid(res):
-    h, w = res
-    grid = torch.stack(
-        torch.meshgrid(torch.linspace(-1, 1, steps=h), torch.linspace(-1, 1, steps=w)),
-        dim=-1,
-    )
+    gridx = torch.tensor(np.linspace(0, 1, res), dtype=torch.float32)
+    gridx = gridx.reshape(1, res, 1, 1).repeat([1, 1, res, 1])
+    gridy = torch.tensor(np.linspace(0, 1, res), dtype=torch.float32)
+    gridy = gridy.reshape(1, 1, res, 1).repeat([1, res, 1, 1])
+    grid = torch.cat((gridx, gridy), dim=-1).reshape(1, -1, 2)
     return grid
 
 
@@ -56,13 +56,22 @@ class GaussianFourierFeatureTransform(torch.nn.Module):
         self._B = nn.Parameter(torch.randn((num_input_channels, mapping_size)) * scale)
 
     def forward(self, x):
-        assert x.dim() == 2 and x.size(1) == self._num_input_channels, (
-            "Expected input shape is [batch_size, num_input_channels]"
+        assert x.dim() == 3 and x.size(2) == self._num_input_channels, (
+            f"Expected input shape is [batch_size, num_input_channels]: [{x.shape[0]}, {self._num_input_channels}], but got {x.shape}"
         )
+
+        batches, num_of_points, channels = x.shape
+        # From [B, N, C] to [(B*N), C].
+        x = rearrange(x, "b n c -> (b n) c")
 
         x = x @ self._B.to(x.device)
 
-        return torch.cat([torch.sin(x), torch.cos(x)], dim=1)
+        # From [(B*W*H), C] to [B, W, H, C]
+        x = rearrange(x, "(b n) c -> b n c", b=batches)
+
+        x = 2 * np.pi * x
+
+        return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
 
 
 class TimestepEmbedder(nn.Module):
@@ -183,26 +192,36 @@ class Mlp(nn.Module):
 
 class QuerieEmbedder(nn.Module):
     """
-    Embeds positional queries into vector representations.
+    Embeds target grids into vector representations.
     """
 
     def __init__(self, hidden_size, pos_dim):
         super().__init__()
-        self.mlp_pos_emb = nn.Sequential(
-            nn.Linear(pos_dim, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=hidden_size,
+            act_layer=approx_gelu,
+            drop=0,
         )
 
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        )
+
+        self.proj = nn.Linear(pos_dim, hidden_size, bias=True)
+
     def forward(self, grid, c):
-        pos_embedding = self.mlp_pos_emb(grid)
-        embedding = self.mlp(pos_embedding)
-        return c.unsqueeze(1) + embedding * c.unsqueeze(1)
+        grid = self.proj(grid)
+
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=1)
+        queries = grid + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm1(grid), shift_mlp, scale_mlp)
+        )
+        return queries
 
 
 class FlashAttention(nn.Module):
@@ -503,7 +522,7 @@ class OperatorTransformer(nn.Module):
             pos_dim: Dimension of positional encodings
             latent_dim: Dimension of latent representations
             num_heads: Number of attention heads
-            depth_enc: Depth of encoder (unused in this implementation but kept for compatibility)
+            depth_enc: Depth of encoder
             depth_dec: Depth of decoder
             scale: Scale parameter for Gaussian Fourier features
             self_per_cross_attn: Number of self-attention blocks per cross-attention block
@@ -528,27 +547,36 @@ class OperatorTransformer(nn.Module):
         cross_heads = num_heads
         self.input_axis = in_channel
         self.hidden_size = latent_dim
+
         # Gaussian Fourier Feature Transform for 2D positions
         self.gfft = GaussianFourierFeatureTransform(2, latent_dim // 2, scale=scale)
         self.latents = nn.Parameter(torch.randn(latent_dim, latent_dim))
 
-        # Project combined context (position features + input data) to the latent dimension
-        self.context_projection = nn.Linear(latent_dim + in_channel, latent_dim)
+        # Create embedder for input data (called x_embedder in transformer.py)
+        self.x_embedder = nn.Linear(out_channel, latent_dim, bias=True)
 
-        in_sizes = [latent_dim * 2, latent_dim, in_channel]
-
-        self.query_embedder = QuerieEmbedder(latent_dim, pos_dim)
+        # Rename for consistency with transformer.py
         self.time_embedder = TimestepEmbedder(latent_dim)
+        self.query_embedder = QuerieEmbedder(latent_dim, latent_dim)
 
-        # Build the decoder blocks: self-attention followed by cross-attention
-        cross_blocks = []
-        for i in range(depth_dec):
-            blocks = []
-            for j in range(self_per_cross_attn):
-                blocks.extend([AttnBlock(latent_dim, num_heads)])
-            blocks.extend([CrossAttnBlock(latent_dim, cross_heads)])
-            cross_blocks.extend(blocks)
-        self.decoder_blocks = nn.ModuleList(cross_blocks)
+        # Restructure to match the encoder-decoder block structure in transformer.py
+        self.enc_block = nn.ModuleList([])
+        for _ in range(depth_enc):
+            enc_attns = nn.ModuleList(
+                [AttnBlock(latent_dim, num_heads) for _ in range(self_per_cross_attn)]
+            )
+            self.enc_block.append(
+                nn.ModuleList([CrossAttnBlock(latent_dim, cross_heads), enc_attns])
+            )
+
+        self.dec_block = nn.ModuleList([])
+        for _ in range(depth_dec):
+            dec_attns = nn.ModuleList(
+                [AttnBlock(latent_dim, num_heads) for _ in range(self_per_cross_attn)]
+            )
+            self.dec_block.append(
+                nn.ModuleList([CrossAttnBlock(latent_dim, cross_heads), dec_attns])
+            )
 
         self.final_layer = FinalLayer(latent_dim, out_channel)
         self.initialize_weights()
@@ -565,24 +593,36 @@ class OperatorTransformer(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize context projection layer
-        nn.init.normal_(self.context_projection.weight, std=0.02)
-        nn.init.constant_(self.context_projection.bias, 0)
+        # Initialize x_embedder weights
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.bias, 0)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
 
-        # Initialize query embedder MLP:
-        nn.init.normal_(self.query_embedder.mlp_pos_emb[0].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp_pos_emb[2].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp[2].weight, std=0.02)
+        # Initialize query embedder
+        nn.init.constant_(self.query_embedder.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.query_embedder.adaLN_modulation[-1].bias, 0)
 
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.decoder_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # Zero-out adaLN modulation layers in encoder blocks
+        for block in self.enc_block:
+            cross_attn, attns = block[0], block[-1]
+            nn.init.constant_(cross_attn.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(cross_attn.adaLN_modulation[-1].bias, 0)
+            for l in range(len(attns)):
+                nn.init.constant_(attns[l].adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(attns[l].adaLN_modulation[-1].bias, 0)
+
+        # Zero-out adaLN modulation layers in decoder blocks
+        for block in self.dec_block:
+            cross_attn, attns = block[0], block[-1]
+            nn.init.constant_(cross_attn.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(cross_attn.adaLN_modulation[-1].bias, 0)
+            for l in range(len(attns)):
+                nn.init.constant_(attns[l].adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(attns[l].adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -612,81 +652,81 @@ class OperatorTransformer(nn.Module):
         Returns:
             output: Processed output tensor of shape [batch_size, out_channels, height, width]
         """
-        # Rearrange input data to have channels as the last dimension
+        # Step 1: Rearrange input data to have channels as the last dimension
         data = rearrange(data, "b c h w -> b h w c")
-        latent_dim = self.hidden_size
 
-        # Step 1: Generate timestep embeddings for conditioning
+        b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
+        assert len(axis) == 2, "input data must have the right number of dimensions"
+
+        # Step 2: Flatten spatial dimensions
+        data = rearrange(data, "b ... c -> b (...) c")
+
+        # Step 3: Generate or use provided position encodings
+        if input_pos is None:
+            grid = make_grid(axis[0])
+            grid = repeat(grid, "b hw c -> (repeat b) hw c", repeat=b)
+            grid = grid.to(data.device)
+            input_pos = output_pos = self.gfft(grid)
+        else:
+            # Use provided positions
+            input_pos = input_pos
+            output_pos = output_pos if output_pos is not None else input_pos
+
+        # Step 4: Apply x_embedder to data and add positional encoding
+        input_emb = self.x_embedder(data) + input_pos
         t_emb = self.time_embedder(t)
 
-        batch_size, h, w, data_chans = data.shape
-        device = data.device
+        # Step 5: Generate queries from output positions
+        queries = self.query_embedder(output_pos, t_emb)
 
-        # Step 2: Generate or use provided position encodings
-        if input_pos is None:
-            # Generate a 2D grid of positions
-            rel_pos = make_grid((h, w)).to(device)
-            inp_pos = rearrange(rel_pos, "h w c -> (h w) c").repeat(batch_size, 1, 1)
-        else:
-            inp_pos = input_pos
-            rel_pos = None
+        # Step 6: Initialize latent representation
+        x = repeat(self.latents, "n d -> b n d", b=b)
+        c = t_emb
 
-        # Step 3: Apply Gaussian Fourier Feature Transform to positions
-        # This creates a higher-dimensional encoding of positions
-        context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
-        context = rearrange(context, "(b n) c -> b n c", b=batch_size)
+        # Step 7: Process through encoder blocks
+        for block in self.enc_block:
+            cross_attn, attns = block[0], block[-1]
+            x = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), x, input_emb, c
+                )
+                if self.training
+                else cross_attn(x, input_emb, c)
+            )
 
-        # Step 4: Concatenate position features with input data
-        # This combines spatial information with data values
-        proj_context = []
-        proj_context.append(data)
-        combined_context = torch.concat([context] + proj_context, dim=-1)
+            for l in range(len(attns)):
+                x = (
+                    torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(attns[l]), x, c)
+                    if self.training
+                    else attns[l](x, c)
+                )
 
-        # Step 5: Project combined context to expected hidden dimension
-        # This ensures the context has the correct dimension for the attention blocks
-        context = self.context_projection(combined_context)
+        # Step 8: Process through decoder blocks
+        for block in self.dec_block:
+            cross_attn, attns = block[0], block[-1]
+            queries = (
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(cross_attn), queries, x, c
+                )
+                if self.training
+                else cross_attn(queries, x, c)
+            )
 
-        # Step 6: Generate query embeddings
-        # These serve as the base representation that will be refined
-        queries = rearrange(self.latents, "n d -> 1 n d").repeat(batch_size, 1, 1)
-        queries = self.query_embedder(inp_pos, t_emb)
-
-        # Step 7: Process through transformer blocks with optional checkpointing
-        # Use gradient checkpointing for transformer blocks during training
-        use_checkpointing = self.training and torch.is_grad_enabled()
-
-        for i, block in enumerate(self.decoder_blocks):
-            if isinstance(block, AttnBlock):
-                # Self-attention refines the query representation
-                if use_checkpointing:
-                    queries = torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(block),
-                        queries,
-                        t_emb,
-                        use_reentrant=False,  # Avoid recomputation of activations, more memory efficient
+            for l in range(len(attns)):
+                queries = (
+                    torch.utils.checkpoint.checkpoint(
+                        self.ckpt_wrapper(attns[l]), queries, c
                     )
-                else:
-                    queries = block(queries, t_emb)
-            elif isinstance(block, CrossAttnBlock):
-                # Cross-attention incorporates contextual information
-                if use_checkpointing:
-                    queries = torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(block),
-                        queries,
-                        context,
-                        t_emb,
-                        use_reentrant=False,  # Avoid recomputation of activations, more memory efficient
-                    )
-                else:
-                    queries = block(queries, context, t_emb)
-            else:
-                assert False
+                    if self.training
+                    else attns[l](queries, c)
+                )
 
-        # Step 8: Generate final output through the final layer
-        z = self.final_layer(queries, t_emb)
-        # Reshape output to expected format [batch, channels, height, width]
-        z_out = rearrange(z, "b (h w) c -> b c h w", h=h, w=w)
-        return z_out
+        # Step 9: Generate final output through the final layer
+        out = self.final_layer(queries, c)
+
+        # Step 10: Reshape output to expected format [batch, channels, height, width]
+        out = rearrange(out, "b (h w) c -> b c h w", h=axis[0], w=axis[1])
+        return out
 
 
 @cache_fn
@@ -749,7 +789,7 @@ class OperatorTransformer_1d(nn.Module):
             num_heads: Number of attention heads
             depth_enc: Depth of encoder (unused in this implementation)
             depth_dec: Depth of decoder
-            scale: Scale parameter for Gaussian Fourier features
+            scale: Scale parameter for Gaussian Fourier features (unused now)
             self_per_cross_attn: Number of self-attention blocks per cross-attention block
             height: Length of the sequence (used for positional encoding)
         """
@@ -772,11 +812,13 @@ class OperatorTransformer_1d(nn.Module):
         cross_heads = num_heads
         self.input_axis = in_channel
         self.hidden_size = latent_dim
-        # Gaussian Fourier Feature Transform for 1D positions
-        self.gfft = GaussianFourierFeatureTransform(1, latent_dim // 2, scale=scale)
+        # GFFT is no longer used for positional encoding
         self.height = height
 
-        # Project combined context (position features + input data) to the latent dimension
+        # Add input embedder similar to transformer.py
+        self.x_embedder = nn.Linear(in_channel, latent_dim)
+
+        # Project combined context (time embedding + input data) to the latent dimension
         self.context_projection = nn.Linear(latent_dim + in_channel, latent_dim)
 
         in_sizes = [latent_dim * 2, latent_dim, in_channel]
@@ -848,54 +890,36 @@ class OperatorTransformer_1d(nn.Module):
         Forward pass through the OperatorTransformer_1d.
 
         Args:
-            data: Input tensor of shape [batch_size, sequence_length, channels]
+            data: Input tensor of shape [batch_size, channels, sequence_length]
             t: Time step tensor of shape [batch_size]
-            input_pos: Optional input positions, if None, uses linspace positions
+            input_pos: Optional input positions (unused in this implementation)
             output_pos: Optional output positions (unused in this implementation)
 
         Returns:
-            output: Processed output tensor of shape [batch_size, sequence_length, out_channels]
+            output: Processed output tensor of shape [batch_size, out_channels, sequence_length]
         """
-        # No rearrangement needed as data is already [batch, sequence, channels]
+        # Rearrange data from [batch, channels, sequence] to [batch, sequence, channels]
+        data = rearrange(data, "b c l -> b l c")
         latent_dim = self.hidden_size
 
         # Step 1: Generate timestep embeddings for conditioning
         t_emb = self.time_embedder(t)
-
-        batch_size, h, feature_size = data.shape
+        batch_size, seq_length, feature_size = data.shape
         device = data.device
 
-        # Step 2: Generate or use provided position encodings
-        if input_pos is None:
-            # Generate a 1D grid of positions from -1 to 1
-            pos_1d = torch.linspace(-1, 1, h).to(device)
-            inp_pos = rearrange(pos_1d, "h -> h 1").repeat(batch_size, 1, 1)
-        else:
-            inp_pos = input_pos
+        # Step 2: Create positional encodings
+        # Generate 1D positional encodings similar to transformer.py
+        pe = positionalencoding1d(latent_dim, seq_length).to(device)
+        position_encodings = rearrange(pe, "n d -> 1 n d").repeat(batch_size, 1, 1)
 
-        # Step 3: Apply Gaussian Fourier Feature Transform to positions
-        # This creates a higher-dimensional encoding of positions
-        context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
-        context = rearrange(context, "(b n) c -> b n c", b=batch_size)
+        # Step 3: Combine data with positional encoding
+        # Apply input embedding and add positional encoding
+        input_emb = self.x_embedder(data) + position_encodings
 
-        # Step 4: Concatenate position features with input data
-        # This combines positional information with data values
-        proj_context = []
-        proj_context.append(data)
-        combined_context = torch.concat([context] + proj_context, dim=-1)
+        # Step 4: Set up queries with positional encoding
+        queries = input_emb.clone()
 
-        # Step 5: Project combined context to expected hidden dimension
-        # This ensures the context has the correct dimension for the attention blocks
-        context = self.context_projection(combined_context)
-
-        # Step 6: Generate query embeddings
-        # First create positional encodings for the output sequence
-        pe = positionalencoding1d(latent_dim, self.height).to(device)
-        queries = rearrange(pe, "n d -> 1 n d").repeat(batch_size, 1, 1)
-        # Then embed the queries with time conditioning
-        queries = self.query_embedder(inp_pos, t_emb)
-
-        # Step 7: Process through transformer blocks with optional checkpointing
+        # Step 5: Process through transformer blocks with optional checkpointing
         # Use gradient checkpointing for transformer blocks during training
         use_checkpointing = self.training and torch.is_grad_enabled()
 
@@ -907,7 +931,7 @@ class OperatorTransformer_1d(nn.Module):
                         self.ckpt_wrapper(block),
                         queries,
                         t_emb,
-                        use_reentrant=False,  # Avoid recomputation of activations, more memory efficient
+                        use_reentrant=False,
                     )
                 else:
                     queries = block(queries, t_emb)
@@ -917,18 +941,21 @@ class OperatorTransformer_1d(nn.Module):
                     queries = torch.utils.checkpoint.checkpoint(
                         self.ckpt_wrapper(block),
                         queries,
-                        context,
+                        input_emb,  # Use input_emb as context instead of GFFT-processed
                         t_emb,
-                        use_reentrant=False,  # Avoid recomputation of activations, more memory efficient
+                        use_reentrant=False,
                     )
                 else:
-                    queries = block(queries, context, t_emb)
+                    queries = block(queries, input_emb, t_emb)
             else:
-                assert False
+                raise ValueError(f"Unknown block type: {type(block)}")
 
-        # Step 8: Generate final output through the final layer
+        # Final output processing
         z = self.final_layer(queries, t_emb)
-        return z
+
+        # Rearrange back to [batch, channels, sequence]
+        z_out = rearrange(z, "b l c -> b c l")
+        return z_out
 
 
 def count_parameters(model):

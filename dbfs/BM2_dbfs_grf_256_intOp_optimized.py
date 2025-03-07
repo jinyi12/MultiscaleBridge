@@ -12,6 +12,7 @@ References:
 import warnings
 import os
 import torchvision.transforms.functional as F
+import time
 
 import fire
 import numpy as np
@@ -213,7 +214,22 @@ def consistency_target(x_t, x_0, x_1, t):
     return (x_0 - x_t) / t + (x_1 - x_t) / (1.0 - t)
 
 
-def euler_discretization(x, xp, nn, energy, chunk_size=128):
+def euler_discretization(x, nn, energy, chunk_size=128, store_control=False):
+    """
+    Performs an Euler–Maruyama discretization of the SDE controlling the process.
+
+    Args:
+        x (Tensor): Tensor of shape [T+1, cache_batch_dim, C, H, W] representing the state trajectory.
+        nn (callable): The neural network drift function.
+        energy (float): A scalar value used in computing the diffusion factor.
+        chunk_size (int, optional): Size of the sub-batches; default is 128.
+        store_control (bool, optional): If True, store the intermediate control values.
+
+    Returns:
+        drift_norms (Tensor): Average squared control norm over the discretization.
+        xp (Tensor or None): If store_control is True, an array storing intermediate control updates;
+                             otherwise, None.
+    """
     # x has shape [T+1, cache_batch_dim, C, H, W]
     T = x.shape[0] - 1  # number of discretization steps
     B = x.shape[1]  # B = cache_batch_dim
@@ -228,47 +244,58 @@ def euler_discretization(x, xp, nn, energy, chunk_size=128):
     a_k = frequencies_squared[None, None]
     sigma_k = th.pow(a_k, -0.01) / energy
 
+    # Optionally initialize storage for the drift control updates.
+    if store_control:
+        xp = th.zeros_like(x[:-1])
+    else:
+        xp = None
+
     for i in range(1, T + 1):
-        t = dt * (i - 1)
-        # Instead of processing the full cache at once, process in chunks:
-        alpha_chunks = []
-        # Split the batch dimension into sub-batches of size chunk_size:
+        t_val = dt * (i - 1)  # shape: (B,)
+        # Determine the output shape by processing a small chunk
+        sample_chunk = min(chunk_size, B)
+        sample_out = nn(x[i - 1][:sample_chunk], t_val[:sample_chunk])
+        # Pre-allocate alpha_t with the known shape
+        alpha_t = th.empty(
+            (B,) + sample_out.shape[1:],
+            device=sample_out.device,
+            dtype=sample_out.dtype,
+        )
+        time_start = time.time()
+        # Process the batch in chunks and fill the pre-allocated tensor
         for start in range(0, B, chunk_size):
             end = min(start + chunk_size, B)
-            # Process a small chunk through the neural network:
-            alpha_chunk = nn(x[i - 1][start:end], t[start:end])
-            alpha_chunks.append(alpha_chunk)
-        # Concatenate the results along the batch dimension:
-        alpha_t = th.cat(alpha_chunks, dim=0)
+            alpha_t[start:end] = nn(x[i - 1][start:end], t_val[start:end])
         drift_norms = drift_norms + th.mean(alpha_t.view(B, -1) ** 2, dim=1)
-
-        # Continue with the rest of Euler discretization using alpha_t,
-        # Convert alpha_t to spectral domain:
-        alpha_t = dct_2d(alpha_t, norm="ortho")
-        # Convert x[i-1] to spectral domain:
-        x_i = dct_2d(x[i - 1], norm="ortho")
-        # (Compute drift, diffusion, etc.)
-        t_ = t[:, None, None, None]
-        t_end = th.ones_like(t_)
-        xp_coeff = alpha_t
-        xp[i - 1] = idct_2d(xp_coeff, norm="ortho")
-        control = (a_(t_, t_end, a_k) * alpha_t - a_2(t_, t_end, a_k) * x_i) / v_(
-            t_, t_end, a_k
+        time_end = time.time()
+        print(
+            f"Time taken for forward process chunking: {time_end - time_start} seconds"
         )
-        drift_t = (-a_k * x_i + control) * dt[:, None, None, None]
+
+        # Convert to the spectral domain using DCT:
+        alpha_t_spec = dct_2d(alpha_t, norm="ortho")
+        x_i_spec = dct_2d(x[i - 1], norm="ortho")
+
+        t_ = t_val[:, None, None, None]
+        t_end = th.ones_like(t_)
+        # Compute control update in spectral domain.
+        control = (
+            a_(t_, t_end, a_k) * alpha_t_spec - a_2(t_, t_end, a_k) * x_i_spec
+        ) / v_(t_, t_end, a_k)
+        if store_control:
+            xp[i - 1] = idct_2d(control, norm="ortho")
+        # Compute drift and diffusion parts in the spectral (DCT) domain.
+        drift_t = (-a_k * x_i_spec + control) * dt[:, None, None, None]
         eps_t = dct_2d(th.randn_like(x[i - 1]), norm="ortho")
+        diffusion_t = (
+            0 if i == T else sigma_k * th.sqrt(dt[:, None, None, None]) * eps_t
+        )
 
-        if i == T:
-            diffusion_t = 0
-        else:
-            diffusion_t = sigma_k * th.sqrt(dt[:, None, None, None]) * eps_t
+        # Update the state for the next time step.
+        x[i] = idct_2d(x_i_spec + drift_t + diffusion_t, norm="ortho")
 
-        # Update x[i] accordingly
-        x[i] = idct_2d(x_i + drift_t + diffusion_t, norm="ortho")
-
-        # Optionally compute and accumulate drift_norms as needed.
     drift_norms = drift_norms / T
-    return drift_norms.cpu()
+    return drift_norms.cpu(), xp
 
 
 # Data ---------------------------------------------------------------------------------
@@ -476,7 +503,7 @@ def init_bm2_nn():
     """Initialize a neural network for BM² that can handle both forward and backward directions.
     This version uses the dedicated BM2Transformer model with separate output heads.
     """
-    from dbfs.models.bm2_transformer import init_bm2_model
+    from models.bm2_transformer import init_bm2_model
 
     return init_bm2_model(
         in_channel=2,
@@ -488,7 +515,7 @@ def init_bm2_nn():
         depth_dec=2,
         scale=1,
         self_per_cross_attn=1,
-        height=256,  # to match the fine fields
+        height=32,  # to match the fine fields
         dim=2,  # 2D data
     )
 
@@ -608,9 +635,9 @@ def run(
 
     # For caching, need to store endpoints of paths:
     s_path = th.zeros(
-        discretization_steps + 1, cache_batch_dim, 1, 256, 256, device=device
+        discretization_steps + 1, cache_batch_dim, 1, 32, 32, device=device
     )  # [T+1, cache_batch_dim, C, H, W]
-    p_path = th.zeros_like(s_path)  # Placeholder for debugging
+    # p_path = th.zeros_like(s_path)  # Placeholder for debugging
 
     if use_bm2:
         # For BM², we use a single neural network for both forward and backward drift
@@ -692,6 +719,22 @@ def run(
                         bwd_losses.reshape(bwd_losses.shape[0], -1), dim=1
                     )
 
+                    # Add integral operator loss for backward direction
+                    if intOp_scale_factor > 0:
+                        # For backward direction: x_0 is the fine field, and bwd_target_t contains coarse field information
+                        losses_intOperator = (
+                            bwd_target_t - coarsen_field(x_0, downsample_factor=1)
+                        ) ** 2
+                        losses_intOperator = th.mean(
+                            losses_intOperator.reshape(losses_intOperator.shape[0], -1),
+                            dim=1,
+                        )
+
+                        # Add weighted integral operator loss to backward loss
+                        bwd_losses = (
+                            bwd_losses + intOp_scale_factor * losses_intOperator
+                        )
+
                     loss = th.mean(fwd_losses + bwd_losses)
 
                 scaler.scale(loss).backward()
@@ -721,25 +764,59 @@ def run(
         console.log("Initializing endpoint caches...")
         with th.no_grad():
             # Create forward path endpoints
-            for _ in range(cache_batch_dim // batch_dim):
-                x_0 = next(tr_iter_0).to(device)
-                # Generate x_1 by simulating the forward process
-                ema.ema(sample_nn)
-                # We need to simulate the forward process to get x_1
-                # This is a simplified version - in practice, you'd use euler_discretization
-                t_ones = th.ones(x_0.shape[0], device=device)
-                x_1 = sample_nn(x_0, t_ones, direction="fwd")
-                fwd_cache_x0.append(x_0.detach())
-                fwd_cache_x1.append(x_1.detach())
+
+            x_0 = next(tr_cache_iter_0).to(device)
+            # Use sample_nn with EMA parameters for generating discretized paths
+            ema.ema(sample_nn)
+
+            # Initialize trajectory array to store the entire trajectory
+            fwd_traj = th.zeros(
+                size=(discretization_steps + 1, x_0.shape[0], *x_0.shape[1:]),
+                device=device,
+            )
+            fwd_traj[0] = x_0  # Set initial condition
+
+            # Use euler_discretization to simulate forward process
+            time_start = time.time()
+            drift_norms, _ = euler_discretization(
+                x=fwd_traj,
+                nn=sample_nn,
+                energy=sigma,
+                chunk_size=int(cache_batch_dim / 2),
+                store_control=False,
+            )
+            time_end = time.time()
+            print(
+                f"Time taken for forward process cache initialization: {time_end - time_start} seconds"
+            )
+            x_1 = fwd_traj[-1]
+
+            fwd_cache_x0.append(x_0.detach())
+            fwd_cache_x1.append(x_1.detach())
 
             # Create backward path endpoints
-            for _ in range(cache_batch_dim // batch_dim):
-                x_1 = next(tr_iter_1).to(device)
-                # Generate x_0 by simulating the backward process
-                t_zeros = th.zeros(x_1.shape[0], device=device)
-                x_0 = sample_nn(x_1, t_zeros, direction="bwd")
-                bwd_cache_x0.append(x_0.detach())
-                bwd_cache_x1.append(x_1.detach())
+
+            x_1 = next(tr_cache_iter_1).to(device)
+
+            # Initialize trajectory array to store the entire trajectory
+            bwd_traj = th.zeros(
+                (discretization_steps + 1, x_1.shape[0], *x_1.shape[1:]),
+                device=device,
+            )
+            bwd_traj[0] = x_1  # Set initial condition
+
+            # Use euler_discretization to simulate backward process
+            drift_norms, _ = euler_discretization(
+                x=bwd_traj,
+                nn=sample_nn,
+                energy=sigma,
+                chunk_size=int(cache_batch_dim / 2),
+                store_control=False,
+            )
+            x_0 = bwd_traj[-1]
+
+            bwd_cache_x0.append(x_0.detach())
+            bwd_cache_x1.append(x_1.detach())
 
         # Convert lists to tensors
         fwd_cache_x0 = th.cat(fwd_cache_x0, dim=0)
@@ -759,32 +836,57 @@ def run(
                 optim.zero_grad()
 
                 # Refresh cache periodically
-                if (step - 1) % cache_steps == 0:
+                if (step - 1) % cache_steps == 0 and step != 1:
                     with th.no_grad():
                         # Update sample_nn with latest EMA parameters
                         ema.ema(sample_nn)
 
                         # Update forward path endpoints
-                        for i in range(0, cache_batch_dim, batch_dim):
-                            end = min(i + batch_dim, cache_batch_dim)
-                            batch_size = end - i
-                            x_0 = next(tr_iter_0).to(device)[:batch_size]
-                            # Generate x_1 by simulating the forward process
-                            t_ones = th.ones(batch_size, device=device)
-                            x_1 = sample_nn(x_0, t_ones, direction="fwd")
-                            fwd_cache_x0[i:end] = x_0.detach()
-                            fwd_cache_x1[i:end] = x_1.detach()
+
+                        x_0 = next(tr_cache_iter_0).to(device)
+
+                        # Initialize trajectory array
+                        fwd_traj = th.zeros(
+                            (discretization_steps + 1, x_0.shape[0], *x_0.shape[1:]),
+                            device=device,
+                        )
+                        fwd_traj[0] = x_0  # Set initial condition
+
+                        # Use euler_discretization to simulate forward process
+                        drift_norms, _ = euler_discretization(
+                            x=fwd_traj,
+                            nn=sample_nn,
+                            energy=sigma,
+                            chunk_size=int(cache_batch_dim / 2),
+                            store_control=False,
+                        )
+                        x_1 = fwd_traj[-1]
+
+                        fwd_cache_x0 = x_0.detach()
+                        fwd_cache_x1 = x_1.detach()
 
                         # Update backward path endpoints
-                        for i in range(0, cache_batch_dim, batch_dim):
-                            end = min(i + batch_dim, cache_batch_dim)
-                            batch_size = end - i
-                            x_1 = next(tr_iter_1).to(device)[:batch_size]
-                            # Generate x_0 by simulating the backward process
-                            t_zeros = th.zeros(batch_size, device=device)
-                            x_0 = sample_nn(x_1, t_zeros, direction="bwd")
-                            bwd_cache_x0[i:end] = x_0.detach()
-                            bwd_cache_x1[i:end] = x_1.detach()
+                        x_1 = next(tr_cache_iter_1).to(device)
+
+                        # Initialize trajectory array
+                        bwd_traj = th.zeros(
+                            (discretization_steps + 1, x_1.shape[0], *x_1.shape[1:]),
+                            device=device,
+                        )
+                        bwd_traj[0] = x_1  # Set initial condition
+
+                        # Use euler_discretization to simulate backward process
+                        drift_norms, _ = euler_discretization(
+                            x=bwd_traj,
+                            nn=sample_nn,
+                            energy=sigma,
+                            chunk_size=int(cache_batch_dim / 2),
+                            store_control=False,
+                        )
+                        x_0 = bwd_traj[-1]
+
+                        bwd_cache_x0 = x_0.detach()
+                        bwd_cache_x1 = x_1.detach()
 
                 # Randomly select samples from cache
                 fwd_idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
@@ -795,8 +897,12 @@ def run(
                 f_1 = fwd_cache_x1[fwd_idx]
 
                 # Get backward path endpoints
-                b_0 = bwd_cache_x0[bwd_idx]
-                b_1 = bwd_cache_x1[bwd_idx]
+                b_1 = bwd_cache_x0[
+                    bwd_idx
+                ]  # consistent naming with the paper, b_1 is the fine field
+                b_0 = bwd_cache_x1[
+                    bwd_idx
+                ]  # consistent naming with the paper, b_0 is the coarse field
 
                 # Sample t avoiding singularities
                 t = (
@@ -806,7 +912,7 @@ def run(
 
                 # Sample bridge points
                 pi_f_t = sample_bridge(f_0, f_1, t, sigma)
-                pi_b_t = sample_bridge(b_0, b_1, t, sigma)
+                pi_b_t = sample_bridge(b_1, b_0, t, sigma)
 
                 # Compute targets and model predictions
                 with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
@@ -825,42 +931,58 @@ def run(
                     loss_f_t = th.mean(loss_f_t.reshape(loss_f_t.shape[0], -1), dim=1)
                     loss_b_t = th.mean(loss_b_t.reshape(loss_b_t.shape[0], -1), dim=1)
 
+                    # Add integral operator loss for backward path
+                    # This enforces that the backward drift respects the coarse-graining operation
+                    if intOp_scale_factor > 0:
+                        # f_1 is the fine field (generated by the forward model)
+                        # and target_b_t is the coarse field f_0.
+                        losses_intOperator = (
+                            target_b_t - coarsen_field(f_1, downsample_factor=1)
+                        ) ** 2
+                        losses_intOperator = th.mean(
+                            losses_intOperator.reshape(losses_intOperator.shape[0], -1),
+                            dim=1,
+                        )
+
+                        # Add weighted integral operator loss to backward loss
+                        loss_f_t = loss_f_t + intOp_scale_factor * losses_intOperator
+
                     loss = th.mean(loss_f_t + loss_b_t)
 
                     # ! NOTE: Currently not adding consistency loss as it is not mentioned in the paper
                     # ! Also because we need to reformulate it in the spectral domain, which is non-trivial for now.
                     # # Optionally add consistency loss
-                    # if consistency_loss_weight > 0:
-                    #     # Sample points from the mixture of forward and backward processes
-                    #     if th.rand(1).item() < 0.5:
-                    #         x_t_mix = pi_f_t
-                    #         x_0_mix = f_0
-                    #         x_1_mix = f_1
-                    #     else:
-                    #         x_t_mix = pi_b_t
-                    #         x_0_mix = b_0
-                    #         x_1_mix = b_1
+                    # # if consistency_loss_weight > 0:
+                    # #     # Sample points from the mixture of forward and backward processes
+                    # #     if th.rand(1).item() < 0.5:
+                    # #         x_t_mix = pi_f_t
+                    # #         x_0_mix = f_0
+                    # #         x_1_mix = f_1
+                    # #     else:
+                    # #         x_t_mix = pi_b_t
+                    # #         x_0_mix = b_0
+                    # #         x_1_mix = b_1
 
-                    #     # Compute consistency target
-                    #     gamma_target = consistency_target(x_t_mix, x_0_mix, x_1_mix, t)
+                    # #     # Compute consistency target
+                    # #     gamma_target = consistency_target(x_t_mix, x_0_mix, x_1_mix, t)
 
-                    #     # Compute model predictions (forward and backward)
-                    #     fwd_pred_mix = nn(x_t_mix, t, direction="fwd")
-                    #     bwd_pred_mix = nn(x_t_mix, t, direction="bwd")
+                    # #     # Compute model predictions (forward and backward)
+                    # #     fwd_pred_mix = nn(x_t_mix, t, direction="fwd")
+                    # #     bwd_pred_mix = nn(x_t_mix, t, direction="bwd")
 
-                    #     # Compute consistency loss
-                    #     consistency_loss = (
-                    #         fwd_pred_mix + bwd_pred_mix - gamma_target
-                    #     ) ** 2
-                    #     consistency_loss = th.mean(
-                    #         consistency_loss.reshape(consistency_loss.shape[0], -1),
-                    #         dim=1,
-                    #     )
+                    # #     # Compute consistency loss
+                    # #     consistency_loss = (
+                    # #         fwd_pred_mix + bwd_pred_mix - gamma_target
+                    # #     ) ** 2
+                    # #     consistency_loss = th.mean(
+                    # #         consistency_loss.reshape(consistency_loss.shape[0], -1),
+                    # #         dim=1,
+                    # #     )
 
-                    #     # Add weighted consistency loss
-                    #     loss = loss + consistency_loss_weight * th.mean(
-                    #         consistency_loss
-                    #     )
+                    # #     # Add weighted consistency loss
+                    # #     loss = loss + consistency_loss_weight * th.mean(
+                    # #         consistency_loss
+                    # #     )
 
                 # Backpropagation and optimization
                 scaler.scale(loss).backward()
@@ -876,16 +998,43 @@ def run(
                         f"BM² Step {step}: loss {loss:.4f}, grad {grad_norm:.4f}"
                     )
 
+                    # Log integral operator loss if it's being used
+                    if intOp_scale_factor > 0:
+                        wandb.log(
+                            {
+                                "bm2/intOp_loss": th.mean(losses_intOperator).item(),
+                                "bm2/total_fwd_loss": th.mean(loss_f_t).item(),
+                                "bm2/total_bwd_loss": th.mean(loss_b_t).item(),
+                                "bm2/total_loss": loss.item(),
+                            },
+                            step=step,
+                        )
+
                 # Checkpointing
                 if step % imge_log_steps == 0 and rank == 0:
-                    save_checkpoint(
-                        {"nn": nn, "optim": optim, "ema": ema, "sample_nn": sample_nn},
-                        iteration,
-                        console,
+                    denorm_fwd = DatasetDenormalization(
+                        fine_normalizer.mean, fine_normalizer.std
+                    )
+                    denorm_bwd = DatasetDenormalization(
+                        coarse_normalizer.mean, coarse_normalizer.std
+                    )
+                    fwd_x_0 = denorm_fwd(f_0)
+                    fwd_x_1 = denorm_fwd(f_1)
+                    bwd_x_0 = denorm_bwd(b_1)
+                    bwd_x_1 = denorm_bwd(b_0)
+                    wandb.log(
+                        {
+                            "bm2/train/fwd_x_0": wandb.Image(fwd_x_0),
+                            "bm2/train/fwd_x_1": wandb.Image(fwd_x_1),
+                            "bm2/train/bwd_x_0": wandb.Image(bwd_x_0),
+                            "bm2/train/bwd_x_1": wandb.Image(bwd_x_1),
+                        },
+                        step=step,
                     )
 
                 # Evaluation using current model
-                if step % (10 * loss_log_steps) == 0 and rank == 0:
+                # High Resolution Test Set
+                if step % (test_steps) == 0 and rank == 0:
                     # Update sample_nn with latest EMA parameters
                     ema.ema(sample_nn)
 
@@ -893,28 +1042,83 @@ def run(
                     with th.no_grad():
                         test_loss_fwd = 0.0
                         test_loss_bwd = 0.0
+                        test_loss_intOperator = 0.0
                         num_batches = 0
 
-                        for x_0_test in te_loader_0:
-                            x_0_test = x_0_test.to(device)
-                            x_1_test = next(iter(te_loader_1)).to(device)
+                        # For L2 loss between coarsened generated fine field and original coarse field
+                        coarsened_fine_fields = []
+                        original_coarse_fields = []
+
+                        for f_0_test, b_1_test in zip(te_loader_0, te_loader_1):
+                            f_0_test = f_0_test.to(device)  # coarse field
+                            b_1_test = b_1_test.to(device)  # fine field
                             t_test = (
-                                th.rand(size=(x_0_test.shape[0],), device=device)
+                                th.rand(size=(f_0_test.shape[0],), device=device)
                                 * (1.0 - 2 * t_epsilon)
                                 + t_epsilon
+                            )  # t in [epsilon, 1-epsilon]
+
+                            # create forward endpoints
+                            fwd_traj = th.zeros(
+                                (
+                                    discretization_steps + 1,
+                                    f_0_test.shape[0],
+                                    1,
+                                    64,
+                                    64,
+                                ),
+                                device=device,
                             )
+                            fwd_traj[0] = f_0_test
+
+                            # create backward endpoints
+                            bwd_traj = th.zeros(
+                                (
+                                    discretization_steps + 1,
+                                    b_1_test.shape[0],
+                                    1,
+                                    64,
+                                    64,
+                                ),
+                                device=device,
+                            )
+                            bwd_traj[0] = b_1_test
+
+                            # simulate forward process
+                            _, _ = euler_discretization(
+                                x=fwd_traj,
+                                nn=sample_nn,
+                                energy=sigma,
+                                chunk_size=f_0_test.shape[0],
+                                store_control=False,
+                            )
+                            f_1_test = fwd_traj[-1]
+
+                            # simulate backward process
+                            _, _ = euler_discretization(
+                                x=bwd_traj,
+                                nn=sample_nn,
+                                energy=sigma,
+                                chunk_size=b_1_test.shape[0],
+                                store_control=False,
+                            )
+                            b_0_test = bwd_traj[-1]
 
                             # Sample bridge points
                             pi_f_t_test = sample_bridge(
-                                x_0_test, x_1_test, t_test, sigma
-                            )
+                                f_0_test, f_1_test, t_test, sigma
+                            )  # forward bridge
                             pi_b_t_test = sample_bridge(
-                                x_0_test, x_1_test, t_test, sigma
-                            )
+                                b_0_test, b_1_test, t_test, sigma
+                            )  # backward bridge
 
                             # Compute targets
-                            target_f_t_test = fwd_target(pi_b_t_test, x_1_test, t_test)
-                            target_b_t_test = bwd_target(pi_f_t_test, x_0_test, t_test)
+                            target_f_t_test = fwd_target(
+                                pi_b_t_test, b_1_test, t_test
+                            )  # forward target,
+                            target_b_t_test = bwd_target(
+                                pi_f_t_test, f_0_test, t_test
+                            )  # backward target
 
                             # Model predictions
                             pred_f_t_test = sample_nn(
@@ -924,28 +1128,200 @@ def run(
                                 pi_f_t_test, t_test, direction="bwd"
                             )
 
-                            # Compute test losses
+                            # Compute test losses (MSE)
                             loss_f_test = th.mean(
                                 ((target_f_t_test - pred_f_t_test) ** 2).reshape(
-                                    x_0_test.shape[0], -1
+                                    f_0_test.shape[0], -1
                                 )
                             )
                             loss_b_test = th.mean(
                                 ((target_b_t_test - pred_b_t_test) ** 2).reshape(
-                                    x_0_test.shape[0], -1
+                                    b_1_test.shape[0], -1
                                 )
                             )
 
+                            # IntOperator loss
+                            loss_intOperator = 0.0
+                            if intOp_scale_factor > 0:
+                                loss_intOperator = th.mean(
+                                    (target_b_t_test - coarsen_field(f_1_test)) ** 2
+                                )
+
                             test_loss_fwd += loss_f_test.item()
                             test_loss_bwd += loss_b_test.item()
+                            test_loss_intOperator += (
+                                loss_intOperator
+                                if isinstance(loss_intOperator, float)
+                                else loss_intOperator.item()
+                            )
                             num_batches += 1
 
                         test_loss_fwd /= num_batches
                         test_loss_bwd /= num_batches
+                        test_loss_intOperator /= num_batches
 
-                        console.log(
-                            f"Test loss - Forward: {test_loss_fwd:.4f}, Backward: {test_loss_bwd:.4f}"
-                        )
+                        if rank == 0:
+                            console.log(f"Test forward MSE loss: {test_loss_fwd:.6f}")
+                            console.log(f"Test backward MSE loss: {test_loss_bwd:.6f}")
+                            console.log(
+                                f"Test intOperator loss: {test_loss_intOperator:.6f}"
+                            )
+
+                            wandb.log(
+                                {
+                                    "bm2/test/total_fwd_loss": test_loss_fwd
+                                    + test_loss_intOperator,
+                                    "bm2/test/total_bwd_loss": test_loss_bwd,
+                                    "bm2/test/total_loss": test_loss_fwd
+                                    + test_loss_bwd
+                                    + test_loss_intOperator,
+                                    "bm2/test/intOperator_loss": test_loss_intOperator,
+                                },
+                                step=step,
+                            )
+
+                            # ########################### High Resolution ###########################
+                            console.log("High Resolution")
+                            with th.no_grad():
+                                te_s_path = th.zeros(
+                                    size=(discretization_steps + 1,)
+                                    + (test_batch_dim, 1, 64, 64),
+                                    device=device,
+                                )
+                                te_p_path = th.zeros(
+                                    size=(discretization_steps,)
+                                    + (test_batch_dim, 1, 64, 64),
+                                    device=device,
+                                )
+                                # Physical field, dont assume range of [0, 1]
+                                drift_norm = []
+
+                                denorm_fine = DatasetDenormalization(
+                                    fine_normalizer.mean, fine_normalizer.std
+                                )
+                                denorm_coarse = DatasetDenormalization(
+                                    coarse_normalizer.mean, coarse_normalizer.std
+                                )
+
+                                # Forward direction high-res testing
+                                for te_x_0, te_x_1 in zip(te_loader_0, te_loader_1):
+                                    te_x_0 = F.resize(te_x_0, 64).to(device)
+                                    te_x_1 = F.resize(te_x_1, 64).to(device)
+
+                                    te_s_path[0] = te_x_0
+                                    drift_norm.append(
+                                        euler_discretization(
+                                            te_s_path,
+                                            te_p_path,
+                                            sample_nn,
+                                            sigma,
+                                            store_control=True,
+                                        )
+                                    )
+                                    break
+
+                                # Log drift norm
+                                if rank == 0:
+                                    wandb.log(
+                                        {
+                                            "bm2/test_high_res/fwd/drift_norm": drift_norm
+                                        },
+                                        step=step,
+                                    )
+
+                                # Log high-resolution forward test images
+                                for i, ti in enumerate(
+                                    resample_indices(discretization_steps + 1, 5)
+                                ):
+                                    if rank == 0:
+                                        denorm_field = denorm_fine(te_s_path[ti])
+                                        wandb.log(
+                                            {
+                                                f"bm2/test_high_res/fwd/x[{i}-{5}]": image_grid(
+                                                    denorm_field
+                                                )
+                                            },
+                                            step=step,
+                                        )
+                                for i, ti in enumerate(
+                                    resample_indices(discretization_steps, 5)
+                                ):
+                                    if rank == 0:
+                                        denorm_field = denorm_fine(te_p_path[ti])
+                                        wandb.log(
+                                            {
+                                                f"bm2/test_high_res/fwd/p[{i}-{5}]": image_grid(
+                                                    denorm_field
+                                                )
+                                            },
+                                            step=step,
+                                        )
+
+                                # Backward direction high-res testing
+                                te_s_path = th.zeros(
+                                    size=(discretization_steps + 1,)
+                                    + (test_batch_dim, 1, 64, 64),
+                                    device=device,
+                                )
+                                te_p_path = th.zeros(
+                                    size=(discretization_steps,)
+                                    + (test_batch_dim, 1, 64, 64),
+                                    device=device,
+                                )
+                                drift_norm = []
+
+                                for te_x_1, te_x_0 in zip(te_loader_1, te_loader_0):
+                                    te_x_1 = F.resize(te_x_1, 64).to(device)
+                                    te_x_0 = F.resize(te_x_0, 64).to(device)
+
+                                    te_s_path[0] = te_x_1
+                                    drift_norm.append(
+                                        euler_discretization(
+                                            te_s_path,
+                                            te_p_path,
+                                            sample_nn,
+                                            sigma,
+                                            store_control=True,
+                                        )
+                                    )
+                                    break
+
+                                # Log drift norm
+                                if rank == 0:
+                                    wandb.log(
+                                        {
+                                            "bm2/test_high_res/bwd/drift_norm": drift_norm
+                                        },
+                                        step=step,
+                                    )
+
+                                # Log high-resolution backward test images
+                                for i, ti in enumerate(
+                                    resample_indices(discretization_steps + 1, 5)
+                                ):
+                                    if rank == 0:
+                                        denorm_field = denorm_coarse(te_s_path[ti])
+                                        wandb.log(
+                                            {
+                                                f"bm2/test_high_res/bwd/x[{i}-{5}]": image_grid(
+                                                    denorm_field
+                                                )
+                                            },
+                                            step=step,
+                                        )
+                                for i, ti in enumerate(
+                                    resample_indices(discretization_steps, 5)
+                                ):
+                                    if rank == 0:
+                                        denorm_field = denorm_coarse(te_p_path[ti])
+                                        wandb.log(
+                                            {
+                                                f"bm2/test_high_res/bwd/p[{i}-{5}]": image_grid(
+                                                    denorm_field
+                                                )
+                                            },
+                                            step=step,
+                                        )
 
         return nn
 
@@ -1036,18 +1412,22 @@ def run(
                             if (step - 1) % cache_steps == 0:
                                 if rank == 0:
                                     console.log(f"cache update: {step}")
-                                # Simulate previously inferred SDE:
-                                s_path[0] = next(tr_cache_iter_0).to(device)
+                                    # Simulate previously inferred SDE:
+                                    s_path[0] = next(tr_cache_iter_0).to(device)
 
-                                euler_discretization(
-                                    s_path, p_path, fwd_sample_nn, sigma
-                                )
-                            # Random selection:
-                            idx = th.randperm(cache_batch_dim, device=device)[
-                                :batch_dim
-                            ]
-                            # Reverse path:
-                            x_0, x_1 = s_path[-1, idx], s_path[0, idx]
+                                    drift_norms, _ = euler_discretization(
+                                        x=s_path,
+                                        nn=sample_nn,
+                                        energy=sigma,
+                                        chunk_size=batch_dim,
+                                        store_control=False,
+                                    )
+                                # Random selection:
+                                idx = th.randperm(cache_batch_dim, device=device)[
+                                    :batch_dim
+                                ]
+                                # Reverse path:
+                                x_0, x_1 = s_path[-1, idx], s_path[0, idx]
                     return x_0, x_1
 
             else:
@@ -1068,7 +1448,13 @@ def run(
                             # Simulate previously inferred SDE:
                             s_path[0] = next(tr_cache_iter_1).to(device)
 
-                            euler_discretization(s_path, p_path, bwd_sample_nn, sigma)
+                            drift_norms, _ = euler_discretization(
+                                x=s_path,
+                                nn=sample_nn,
+                                energy=sigma,
+                                chunk_size=batch_dim,
+                                store_control=False,
+                            )
                         # Random selection:
                         idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
                         # Reverse path:
@@ -1129,180 +1515,190 @@ def run(
                         console.log(f"test: {step}")
                     ema.ema(sample_nn)
 
-                # Save per each iteration
-                saves = [bwd_nn, bwd_ema, bwd_optim, fwd_nn, fwd_ema, fwd_optim]
-                save_checkpoint(saves, iteration, console)
+                    # Save per each iteration
+                    saves = [bwd_nn, bwd_ema, bwd_optim, fwd_nn, fwd_ema, fwd_optim]
+                    save_checkpoint(saves, iteration, console)
 
-                with th.no_grad():
-                    te_s_path = th.zeros(
-                        size=(discretization_steps + 1,) + (test_batch_dim, 1, 32, 32),
-                        device=device,
-                    )
-                    te_p_path = th.zeros(
-                        size=(discretization_steps,) + (test_batch_dim, 1, 32, 32),
-                        device=device,
-                    )
-                    # Physical field so use L2 loss
-                    l2_losses = []
+                    with th.no_grad():
+                        te_s_path = th.zeros(
+                            size=(discretization_steps + 1,)
+                            + (test_batch_dim, 1, 32, 32),
+                            device=device,
+                        )
+                        # te_p_path = th.zeros(
+                        #     size=(discretization_steps,) + (test_batch_dim, 1, 32, 32),
+                        #     device=device,
+                        # )
+                        # Physical field so use L2 loss
+                        l2_losses = []
 
-                    drift_norm = []
-                    # console.log("Drift norm computation")
-                    # console.log("te_loader_x_0: ", len(te_loader_x_0))
-                    # console.log("te_loader_x_1: ", len(te_loader_x_1))
+                        drift_norm = []
+                        # console.log("Drift norm computation")
+                        # console.log("te_loader_x_0: ", len(te_loader_x_0))
+                        # console.log("te_loader_x_1: ", len(te_loader_x_1))
 
-                    for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
-                        # x_1 is coarse field if backward direction, fine field if forward direction
-                        # x_0 is fine field if backward direction, coarse field if forward direction
-                        te_x_0, te_x_1 = te_x_0.to(device), te_x_1.to(device)
-                        te_s_path[0] = te_x_0
-                        drift_norm.append(
-                            euler_discretization(te_s_path, te_p_path, sample_nn, sigma)
+                        for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
+                            # x_1 is coarse field if backward direction, fine field if forward direction
+                            # x_0 is fine field if backward direction, coarse field if forward direction
+                            te_x_0, te_x_1 = te_x_0.to(device), te_x_1.to(device)
+                            te_s_path[0] = te_x_0
+                            drift_norms, te_p_path = euler_discretization(
+                                x=te_s_path,
+                                nn=sample_nn,
+                                energy=sigma,
+                                chunk_size=batch_dim,
+                                store_control=False,
+                            )
+                            drift_norm.append(drift_norms)
+
+                            # Compute L2 loss between generated field and target
+                            generated_field = te_s_path[-1]
+
+                            if direction == "fwd":
+                                # if forward, we want to coarsen the generated fine field
+                                # to calculate the L2 loss with the starting coarse field
+                                # to ensure the coarsen
+                                # field is of same regularity as the starting field
+                                target_field = te_x_0
+                                generated_field = coarsen_field(
+                                    generated_field, downsample_factor=1
+                                )
+
+                                l2_loss = th.nn.functional.mse_loss(
+                                    generated_field, target_field
+                                )
+                            else:
+                                # if backward, we want to compare the generated coarse field
+                                # with the target coarse field
+                                target_field = te_x_1
+                                l2_loss = th.nn.functional.mse_loss(
+                                    generated_field, target_field
+                                )
+
+                            l2_losses.append(l2_loss.item())
+
+                        drift_norm = th.mean(th.cat(drift_norm)).item()
+                        mean_l2_loss = np.mean(l2_losses)
+
+                        denorm_fine = DatasetDenormalization(
+                            fine_normalizer.mean, fine_normalizer.std
+                        )
+                        denorm_coarse = DatasetDenormalization(
+                            coarse_normalizer.mean, coarse_normalizer.std
                         )
 
-                        # Compute L2 loss between generated field and target
-                        generated_field = te_s_path[-1]
-
-                        if direction == "fwd":
-                            # if forward, we want to coarsen the generated fine field
-                            # to calculate the L2 loss with the starting coarse field
-                            # to ensure the coarsen
-                            # field is of same regularity as the starting field
-                            target_field = te_x_0
-                            generated_field = coarsen_field(
-                                generated_field, downsample_factor=1
+                        if rank == 0:
+                            wandb.log(
+                                {f"{direction}/test/drift_norm": drift_norm}, step=step
                             )
 
-                            l2_loss = th.nn.functional.mse_loss(
-                                generated_field, target_field
+                        if rank == 0:
+                            wandb.log(
+                                {f"{direction}/test/l2_loss": mean_l2_loss}, step=step
                             )
-                        else:
-                            # if backward, we want to compare the generated coarse field
-                            # with the target coarse field
-                            target_field = te_x_1
-                            l2_loss = th.nn.functional.mse_loss(
-                                generated_field, target_field
-                            )
+                        if rank == 0:
+                            console.log(f"mean L2 loss: {mean_l2_loss}")
+                        for i, ti in enumerate(
+                            resample_indices(discretization_steps + 1, 5)
+                        ):
+                            if rank == 0:
+                                denorm_field = (
+                                    denorm_fine(te_s_path[ti])
+                                    if direction == "fwd"
+                                    else denorm_coarse(te_s_path[ti])
+                                )
+                                wandb.log(
+                                    {
+                                        f"{direction}/test/x[{i}-{5}]": image_grid(
+                                            denorm_field
+                                        )
+                                    },
+                                    step=step,
+                                )
+                        for i, ti in enumerate(
+                            resample_indices(discretization_steps, 5)
+                        ):
+                            if rank == 0:
+                                denorm_field = (
+                                    denorm_fine(te_p_path[ti])
+                                    if direction == "fwd"
+                                    else denorm_coarse(te_p_path[ti])
+                                )
+                                wandb.log(
+                                    {
+                                        f"{direction}/test/p[{i}-{5}]": image_grid(
+                                            denorm_field
+                                        )
+                                    },
+                                    step=step,
+                                )
 
-                        l2_losses.append(l2_loss.item())
-
-                    drift_norm = th.mean(th.cat(drift_norm)).item()
-                    mean_l2_loss = np.mean(l2_losses)
-
-                    denorm_fine = DatasetDenormalization(
-                        fine_normalizer.mean, fine_normalizer.std
-                    )
-                    denorm_coarse = DatasetDenormalization(
-                        coarse_normalizer.mean, coarse_normalizer.std
-                    )
-
+                if step % loss_log_steps == 0:
                     if rank == 0:
                         wandb.log(
-                            {f"{direction}/test/drift_norm": drift_norm}, step=step
+                            {
+                                f"{direction}/train/loss": loss.item(),
+                                f"{direction}/train/base_loss": losses.mean().item(),
+                                f"{direction}/train/operator_loss": (
+                                    losses_intOperator.mean().item()
+                                    if direction == "bwd"
+                                    else 0
+                                ),
+                                f"{direction}/train/intOp_scale_factor": intOp_scale_factor,
+                            },
+                            step=step,
                         )
-
                     if rank == 0:
                         wandb.log(
-                            {f"{direction}/test/l2_loss": mean_l2_loss}, step=step
+                            {f"{direction}/train/grad_norm": grad_norm}, step=step
                         )
-                    if rank == 0:
-                        console.log(f"mean L2 loss: {mean_l2_loss}")
-                    for i, ti in enumerate(
-                        resample_indices(discretization_steps + 1, 5)
-                    ):
-                        if rank == 0:
-                            denorm_field = (
-                                denorm_fine(te_s_path[ti])
-                                if direction == "fwd"
-                                else denorm_coarse(te_s_path[ti])
-                            )
-                            wandb.log(
-                                {
-                                    f"{direction}/test/x[{i}-{5}]": image_grid(
-                                        denorm_field
-                                    )
-                                },
-                                step=step,
-                            )
-                    for i, ti in enumerate(resample_indices(discretization_steps, 5)):
-                        if rank == 0:
-                            denorm_field = (
-                                denorm_fine(te_p_path[ti])
-                                if direction == "fwd"
-                                else denorm_coarse(te_p_path[ti])
-                            )
-                            wandb.log(
-                                {
-                                    f"{direction}/test/p[{i}-{5}]": image_grid(
-                                        denorm_field
-                                    )
-                                },
-                                step=step,
-                            )
 
-            if step % loss_log_steps == 0:
-                if rank == 0:
-                    wandb.log(
-                        {
-                            f"{direction}/train/loss": loss.item(),
-                            f"{direction}/train/base_loss": losses.mean().item(),
-                            f"{direction}/train/operator_loss": (
-                                losses_intOperator.mean().item()
-                                if direction == "bwd"
-                                else 0
+                if step % imge_log_steps == 0:
+                    if rank == 0:
+                        # Choose normalizer based on direction
+                        denorm_0 = DatasetDenormalization(
+                            (
+                                coarse_normalizer.mean
+                                if direction == "fwd"
+                                else fine_normalizer.mean
                             ),
-                            f"{direction}/train/intOp_scale_factor": intOp_scale_factor,
-                        },
-                        step=step,
-                    )
-                if rank == 0:
-                    wandb.log({f"{direction}/train/grad_norm": grad_norm}, step=step)
+                            (
+                                coarse_normalizer.std
+                                if direction == "fwd"
+                                else fine_normalizer.std
+                            ),
+                        )
+                        denorm_1 = DatasetDenormalization(
+                            (
+                                fine_normalizer.mean
+                                if direction == "fwd"
+                                else coarse_normalizer.mean
+                            ),
+                            (
+                                fine_normalizer.std
+                                if direction == "fwd"
+                                else coarse_normalizer.std
+                            ),
+                        )
 
-            if step % imge_log_steps == 0:
-                if rank == 0:
-                    # Choose normalizer based on direction
-                    denorm_0 = DatasetDenormalization(
-                        (
-                            coarse_normalizer.mean
-                            if direction == "fwd"
-                            else fine_normalizer.mean
-                        ),
-                        (
-                            coarse_normalizer.std
-                            if direction == "fwd"
-                            else fine_normalizer.std
-                        ),
-                    )
-                    denorm_1 = DatasetDenormalization(
-                        (
-                            fine_normalizer.mean
-                            if direction == "fwd"
-                            else coarse_normalizer.mean
-                        ),
-                        (
-                            fine_normalizer.std
-                            if direction == "fwd"
-                            else coarse_normalizer.std
-                        ),
-                    )
+                        # Denormalize before visualization
+                        x_0_denorm = denorm_0(x_0)
+                        x_1_denorm = denorm_1(x_1)
 
-                    # Denormalize before visualization
-                    x_0_denorm = denorm_0(x_0)
-                    x_1_denorm = denorm_1(x_1)
+                        wandb.log(
+                            {f"{direction}/train/x_0": image_grid(x_0_denorm, False)},
+                            step=step,
+                        )
+                        wandb.log(
+                            {f"{direction}/train/x_1": image_grid(x_1_denorm, False)},
+                            step=step,
+                        )
 
-                    wandb.log(
-                        {f"{direction}/train/x_0": image_grid(x_0_denorm, False)},
-                        step=step,
-                    )
-                    wandb.log(
-                        {f"{direction}/train/x_1": image_grid(x_1_denorm, False)},
-                        step=step,
-                    )
-
-            if step % training_steps == 0:
-                if rank == 0:
-                    console.log(f"EMA update: {step}")
-                # Make sure EMA is updated at the end of each iteration:
-                ema.ema(sample_nn)
+                if step % training_steps == 0:
+                    if rank == 0:
+                        console.log(f"EMA update: {step}")
+                    # Make sure EMA is updated at the end of each iteration:
+                    ema.ema(sample_nn)
 
     progress.stop()
 
@@ -1311,7 +1707,7 @@ def save_checkpoint(saves, iteration, console):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
     checkpoint = {}
     i = 0
-    fn = "./checkpoint/grf_10k_256_intOp_scaled.npz"
+    fn = "./checkpoint/BM2_grf_10k_256_intOp_scaled.npz"
     keys = ["bwd_nn", "bwd_ema", "bwd_optim", "fwd_nn", "fwd_ema", "fwd_optim"]
 
     with th.cuda.device(rank):
@@ -1327,7 +1723,7 @@ def save_checkpoint(saves, iteration, console):
 def restore_checkpoint(saves, console):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
     i = 0
-    load_name = "./checkpoint/grf_10k_256_intOp_scaled.npz"
+    load_name = "./checkpoint/BM2_grf_10k_256_intOp_scaled.npz"
     assert load_name is not None
     if rank == 0:
         console.log(f"#loading checkpoint {load_name}...")
@@ -1346,13 +1742,15 @@ def restore_checkpoint(saves, console):
 
 if __name__ == "__main__":
     config = {
-        "batch_dim": 64,  # Increased for better GPU utilization
+        "batch_dim": 128,  # Increased for better GPU utilization
         "cache_batch_dim": 2560,  #
         "cache_steps": 250,
         "test_steps": 5000,  # More frequent evaluation
         "iterations": 30,
         "training_steps": 5000,
         "load": False,  # continue training
+        "intOp_scale_factor": 0.1,
+        "two_stage_training": False,
     }
 
     fire.Fire(run(**config))
