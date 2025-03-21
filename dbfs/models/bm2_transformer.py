@@ -2,13 +2,17 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from models.transformer_flash_attention import (
+from .transformer_flash_attention import (
     OperatorTransformer,
     OperatorTransformer_1d,
     FinalLayer,
     make_grid,
     positionalencoding1d,
 )
+
+from einops._torch_specific import allow_ops_in_compiled_graph  # requires einops>=0.6.1
+
+allow_ops_in_compiled_graph()
 
 
 class BM2Transformer(OperatorTransformer):
@@ -28,6 +32,8 @@ class BM2Transformer(OperatorTransformer):
 
     def __init__(
         self,
+        in_axis,
+        out_axis,
         in_channel,
         out_channel,
         pos_dim,
@@ -38,11 +44,14 @@ class BM2Transformer(OperatorTransformer):
         scale,
         self_per_cross_attn,
         height,
+        use_checkpointing=True,  # whether to use checkpointing for forward pass
     ):
         """
         Initialize the BM2Transformer model.
 
         Args:
+            in_axis: Number of input axes, e.g. 2 for 2D data
+            out_axis: Number of output axes, e.g. 2 for 2D data
             in_channel: Number of input channels
             out_channel: Number of output channels
             pos_dim: Dimension of positional encodings
@@ -55,6 +64,22 @@ class BM2Transformer(OperatorTransformer):
             height: Height dimension of the spatial grid
         """
         super().__init__(
+            in_axis,
+            out_axis,
+            in_channel,
+            out_channel,
+            pos_dim,
+            latent_dim,
+            num_heads,
+            depth_enc,
+            depth_dec,
+            scale,
+            self_per_cross_attn,
+            height,
+        )
+        self.locals = (
+            in_axis,
+            out_axis,
             in_channel,
             out_channel,
             pos_dim,
@@ -67,17 +92,29 @@ class BM2Transformer(OperatorTransformer):
             height,
         )
 
-        # Add direction embedding
-        self.direction_embedding = nn.Embedding(2, latent_dim)
+        # # Add direction embedding
+        # self.direction_embedding = nn.Embedding(2, latent_dim)
+
+        # # Conditioning projection, takes the direction embedding and the timestep embedding and concatenates them
+        # # and projects them to the latent dimension
+        # self.conditioning_projection = nn.Linear(2 * latent_dim, latent_dim)
 
         # Create separate output heads for forward and backward directions
         # Keep the original final_layer as the forward head for compatibility
         self.forward_head = self.final_layer
         self.backward_head = FinalLayer(latent_dim, out_channel)
 
-        # Initialize the direction embedding and backward head
-        nn.init.normal_(self.direction_embedding.weight, std=0.02)
+        # Initialize the backward head
         self._initialize_backward_head()
+
+        self.use_checkpointing = use_checkpointing
+
+    def maybe_checkpoint(self, module, *args):
+        """Helper method to optionally apply checkpointing based on configuration"""
+        if self.training and self.use_checkpointing and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(module), *args)
+        else:
+            return module(*args)
 
     def _initialize_backward_head(self):
         """Initialize the backward head with the same initialization as the forward head"""
@@ -105,17 +142,25 @@ class BM2Transformer(OperatorTransformer):
 
         b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
 
-        # Convert direction to tensor indices
-        dir_idx = 0 if direction == "fwd" else 1
-        dir_idx = torch.tensor([dir_idx] * t.shape[0], device=t.device)
-        dir_emb = self.direction_embedding(dir_idx)
+        assert len(axis) == self.input_axis, (
+            "input data must have the right number of axis"
+        )
 
-        latent_dim = self.hidden_size
+        # Convert direction to tensor indices
+        # dir_idx = 0 if direction == "fwd" else 1
+        # dir_idx = torch.tensor([dir_idx] * t.shape[0], device=t.device)
+        # dir_emb = self.direction_embedding(dir_idx)
 
         # Step 1: Generate timestep embeddings with direction conditioning
         t_emb_base = self.time_embedder(t)
-        # Add direction information to timestep embedding
-        t_emb = t_emb_base + dir_emb
+
+        # Project the direction embedding and the timestep embedding and concatenate them
+        # and project them to the latent dimension
+        # conditioning = self.conditioning_projection(
+        #     torch.cat([dir_emb, t_emb_base], dim=-1)
+        # )
+
+        conditioning = t_emb_base
 
         batch_size, h, w, data_chans = data.shape
         device = data.device
@@ -125,76 +170,51 @@ class BM2Transformer(OperatorTransformer):
             grid = make_grid(axis[0])
             grid = repeat(grid, "b hw c -> (repeat b) hw c", repeat=b)
             grid = grid.to(data.device)
+            # # Step 3: Apply Gaussian Fourier Feature Transform to positions
             input_pos = output_pos = self.gfft(grid)
         else:
-            raise NotImplementedError("Not implemented")
+            # Apply Gaussian Fourier Feature Transform to positions
+            input_pos = output_pos = self.gfft(input_pos)
 
-        # # Step 3: Apply Gaussian Fourier Feature Transform to positions
-        # context = self.gfft(rearrange(inp_pos, "b n c -> (b n) c"))
-        # context = rearrange(context, "(b n) c -> b n c", b=batch_size)
         context = input_pos
 
         # Step 4: Combine positional encoding with projected input data
         flattened_data = rearrange(data, "b ... c -> b (...) c")
+        # print("flattened_data.shape", flattened_data.shape)
         input_emb = self.x_embedder(flattened_data) + context
 
         # Step 5: Generate query embeddings with direction conditioning
-        queries = self.query_embedder(output_pos, t_emb)
+        queries = self.query_embedder(output_pos, conditioning)
 
         # Step 6: make repeated random latents
         x = repeat(self.latents, "n d -> b n d", b=b)
-        c = t_emb
+        c = conditioning
 
         # Step 7: Process through transformer blocks with optional checkpointing
-        use_checkpointing = self.training and torch.is_grad_enabled()
-
         # Process through encoder blocks
         for block in self.enc_block:
             cross_attn, attns = block[0], block[-1]
-            x = (
-                torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(cross_attn), x, input_emb, c
-                )
-                if self.training
-                else cross_attn(x, input_emb, c)
-            )
+            x = self.maybe_checkpoint(cross_attn, x, input_emb, c)
 
             for l in range(len(attns)):
-                x = (
-                    torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(attns[l]), x, c)
-                    if self.training
-                    else attns[l](x, c)
-                )
+                x = self.maybe_checkpoint(attns[l], x, c)
 
         # Process through decoder blocks
         for block in self.dec_block:
             cross_attn, attns = block[0], block[-1]
-            queries = (
-                torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(cross_attn), queries, x, c
-                )
-                if self.training
-                else cross_attn(queries, x, c)
-            )
+            queries = self.maybe_checkpoint(cross_attn, queries, x, c)
 
             for l in range(len(attns)):
-                queries = (
-                    torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(attns[l]), queries, c
-                    )
-                    if self.training
-                    else attns[l](queries, c)
-                )
+                queries = self.maybe_checkpoint(attns[l], queries, c)
 
-        # Step 8: Generate final output through the appropriate head based on direction
-        if direction == "fwd":
-            z = self.forward_head(queries, t_emb)
-        else:
-            z = self.backward_head(queries, t_emb)
+        # Step 8: Generate final output forward and backward
+        z_forward = self.forward_head(queries, conditioning)
+        z_backward = self.backward_head(queries, conditioning)
 
         # Reshape output to expected format [batch, channels, height, width]
-        z_out = rearrange(z, "b (h w) c -> b c h w", h=h, w=w)
-        return z_out
+        z_forward_out = rearrange(z_forward, "b (h w) c -> b c h w", h=h, w=w)
+        z_backward_out = rearrange(z_backward, "b (h w) c -> b c h w", h=h, w=w)
+        return z_forward_out, z_backward_out
 
 
 class BM2Transformer1D(OperatorTransformer_1d):
@@ -248,10 +268,26 @@ class BM2Transformer1D(OperatorTransformer_1d):
             self_per_cross_attn,
             height,
         )
+        self.locals = (
+            in_channel,
+            out_channel,
+            pos_dim,
+            latent_dim,
+            num_heads,
+            depth_enc,
+            depth_dec,
+            scale,
+            self_per_cross_attn,
+            height,
+        )
 
         # --- Direction Conditioning ---
         # Add a direction embedding to distinguish forward ("fwd") and backward ("bwd") directions.
         self.direction_embedding = nn.Embedding(2, latent_dim)
+
+        # Conditioning projection, takes the direction embedding and the timestep embedding and concatenates them
+        # and projects them to the latent dimension
+        self.conditioning_projection = nn.Linear(2 * latent_dim, latent_dim)
 
         # Create separate final output heads for forward and backward directions.
         # The forward head is kept identical to the parent's final_layer for compatibility.
@@ -296,7 +332,12 @@ class BM2Transformer1D(OperatorTransformer_1d):
 
         # Step 1: Generate timestep embeddings with directional conditioning.
         t_emb_base = self.time_embedder(t)
-        t_emb = t_emb_base + dir_emb
+
+        # Project the direction embedding and the timestep embedding and concatenate them
+        # and project them to the latent dimension
+        conditioning = self.conditioning_projection(
+            torch.cat([dir_emb, t_emb_base], dim=-1)
+        )
 
         # Step 2: Create 1D positional encodings.
         pe = positionalencoding1d(latent_dim, seq_length).to(data.device)
@@ -313,7 +354,7 @@ class BM2Transformer1D(OperatorTransformer_1d):
 
         # Step 5: Initialize latent representation.
         x = repeat(self.latents, "n d -> b n d", b=batch_size)
-        c = t_emb
+        c = conditioning
 
         # Step 6: Process through encoder blocks.
         for block in self.enc_block:
@@ -353,70 +394,10 @@ class BM2Transformer1D(OperatorTransformer_1d):
 
         # Step 8: Compute final output through the appropriate head.
         if direction == "fwd":
-            z = self.forward_head(queries, t_emb)
+            z = self.forward_head(queries, conditioning)
         else:
-            z = self.backward_head(queries, t_emb)
+            z = self.backward_head(queries, conditioning)
 
         # Step 9: Rearrange output to shape [batch, channels, sequence_length] and return.
         z_out = rearrange(z, "b l c -> b c l")
         return z_out
-
-
-def init_bm2_model(
-    in_channel=2,
-    out_channel=1,
-    pos_dim=256,
-    latent_dim=256,
-    num_heads=4,
-    depth_enc=6,
-    depth_dec=2,
-    scale=1,
-    self_per_cross_attn=1,
-    height=256,
-    dim=2,  # Default is 2D
-):
-    """
-    Initialize a BM2 model for either 1D or 2D data.
-
-    Args:
-        in_channel: Number of input channels
-        out_channel: Number of output channels
-        pos_dim: Dimension of positional encodings
-        latent_dim: Dimension of latent representations
-        num_heads: Number of attention heads
-        depth_enc: Depth of encoder
-        depth_dec: Depth of decoder
-        scale: Scale parameter for Gaussian Fourier features
-        self_per_cross_attn: Number of self-attention blocks per cross-attention block
-        height: Height/length dimension
-        dim: Dimensionality of data (1 or 2)
-
-    Returns:
-        A BM2Transformer or BM2Transformer1D model
-    """
-    if dim == 1:
-        return BM2Transformer1D(
-            in_channel=in_channel,
-            out_channel=out_channel,
-            pos_dim=pos_dim,
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            depth_enc=depth_enc,
-            depth_dec=depth_dec,
-            scale=scale,
-            self_per_cross_attn=self_per_cross_attn,
-            height=height,
-        )
-    else:
-        return BM2Transformer(
-            in_channel=in_channel,
-            out_channel=out_channel,
-            pos_dim=pos_dim,
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            depth_enc=depth_enc,
-            depth_dec=depth_dec,
-            scale=scale,
-            self_per_cross_attn=self_per_cross_attn,
-            height=height,
-        )

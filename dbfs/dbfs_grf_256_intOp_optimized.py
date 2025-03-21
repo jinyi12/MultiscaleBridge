@@ -534,7 +534,6 @@ def run(
     imge_log_steps=1000,
     load=False,
 ):
-
     config = locals()
     assert isinstance(sigma, float) and sigma >= 0
     assert isinstance(learning_rate, float) and learning_rate > 0
@@ -728,6 +727,9 @@ def run(
             t = th.rand(size=(batch_dim,), device=device) * t_T
             x_t = sample_bridge(x_0, x_1, t, sigma)
             # print("Shape of x_t: ", x_t.shape)
+
+            # during backward x_1 the euler discretization obtained coarse field, x_0 is the fine field
+            # during forward x_0 is the coarse field from euler discretization, x_1 is the fine field
             target_t = dbfs_target(x_t, x_1, t)
 
             with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
@@ -764,7 +766,6 @@ def run(
             ema.update()
 
             if step % test_steps == 0:
-
                 if rank == 0:
                     console.log(f"test: {step}")
                 ema.ema(sample_nn)
@@ -905,7 +906,6 @@ def run(
                     )
 
                     for te_x_0, te_x_1 in zip(te_loader_x_0, te_loader_x_1):
-
                         te_x_0 = F.resize(te_x_0, 64).to(device)
                         te_x_1 = F.resize(te_x_1, 64).to(device)
 

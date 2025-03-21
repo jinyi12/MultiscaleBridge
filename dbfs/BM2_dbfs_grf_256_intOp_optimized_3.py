@@ -30,24 +30,29 @@ from rich.progress import (
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.utils import make_grid
-from models.transformer import OperatorTransformer
-from dct import dct_2d, idct_2d
+from .models.transformer import OperatorTransformer
+from .dct import dct_2d, idct_2d
 
 # DDP
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models.bm2_transformer import BM2Transformer
+from .models.bm2_transformer import BM2Transformer
 from einops import repeat, rearrange
 
 warnings.filterwarnings("ignore")
 
 # EMA
 from ema_pytorch import EMA
-from utils import make_data_grid
+from .utils import make_data_grid
 
-data_path = os.path.expanduser("~/torch-data/")
+# Get the directory where this script is located
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the absolute path to the data file relative to the script location
+coarse_data_path = os.path.join(BASE_DIR, "../Data/coarse_grf_10k.npy")
+fine_data_path = os.path.join(BASE_DIR, "../Data/fine_grf_10k.npy")
 
 # DDP
 if th.cuda.is_available() and th.cuda.device_count() > 1:
@@ -228,7 +233,6 @@ def euler_discretization(
     energy,
     chunk_size=128,
     store_control=False,
-    reverse=False,
     direction_fn="fwd",
 ):
     """
@@ -240,8 +244,6 @@ def euler_discretization(
         energy (float): A scalar value used in computing the diffusion factor.
         chunk_size (int, optional): Size of the sub-batches; default is 128.
         store_control (bool, optional): If True, store the intermediate control values.
-        reverse (bool, optional): If True, integrates backward from t=1 to 0 (negative dt).
-                                 If False (default), integrates forward from t=0 to 1.
         direction_fn (str, optional): The function to use for the direction of the discretization.
                                         If "fwd", integrates using forward drift.
                                         If "bwd", integrates using backward drift.
@@ -255,16 +257,10 @@ def euler_discretization(
     T = x.shape[0] - 1  # number of discretization steps
     B = x.shape[1]  # B = cache_batch_dim
 
-    # Set time direction based on reverse flag
     dt_val = 1.0 / T
-    if reverse:
-        t_start = 1.0
-        t_end = 0.0
-        dt = -th.full((B,), dt_val, device=x.device)
-    else:
-        t_start = 0.0
-        t_end = 1.0
-        dt = th.full((B,), dt_val, device=x.device)
+    t_start = 0.0
+    t_end = 1.0
+    dt = th.full((B,), dt_val, device=x.device)
 
     drift_norms = 0.0
     _, b, c, h, w = x.shape
@@ -288,7 +284,7 @@ def euler_discretization(
 
     for i in range(1, T + 1):
         # Current time based on direction
-        t_val = t_start + (i - 1) * dt_val * (-1 if reverse else 1)
+        t_val = (i - 1) * dt_val
         t_tensor = th.full((B,), t_val, device=x.device)
 
         # Process the neural network in chunks
@@ -317,7 +313,7 @@ def euler_discretization(
 
         # Compute time tensors for control computation
         t_ = t_tensor[:, None, None, None]
-        t_end_tensor = th.full_like(t_, t_end)
+        t_end_tensor = th.ones_like(t_)  # spectral euler only works for t_end = 1
 
         # Compute control in spectral domain
         control = (
@@ -447,7 +443,7 @@ class ToTensorCustom:
 
 class DatasetNormalization:
     def __init__(self, train_data_path):
-        # Load training data
+        # Use the provided train_data_path; here it should be the absolute path.
         train_data = np.load(train_data_path)
         self.mean = train_data.mean()
         self.std = train_data.std()
@@ -455,7 +451,6 @@ class DatasetNormalization:
     def __call__(self, x):
         if isinstance(x, np.ndarray):
             x = th.from_numpy(x).float()
-        # Normalize to [-1,1] using training statistics
         return (x - self.mean) / self.std
 
 
@@ -469,9 +464,10 @@ class DatasetDenormalization:
         return x * self.std + self.mean
 
 
-# Create normalizers using only training data
-coarse_normalizer = DatasetNormalization("../Data/coarse_grf_10k.npy")
-fine_normalizer = DatasetNormalization("../Data/fine_grf_10k.npy")
+# Now, when creating the DatasetNormalization instance,
+# use the absolute path computed above.
+coarse_normalizer = DatasetNormalization(coarse_data_path)
+fine_normalizer = DatasetNormalization(fine_data_path)
 
 # Normalization transform
 transform_coarse = transforms.Compose([ToTensorCustom(), coarse_normalizer])
@@ -480,22 +476,22 @@ transform_fine = transforms.Compose([ToTensorCustom(), fine_normalizer])
 
 # Load datasets for coarse (source) and fine (target) fields
 tr_data_0 = FieldsDataset(
-    data_path="../Data/coarse_grf_10k.npy",
+    data_path=coarse_data_path,
     train=True,
     transform=transform_coarse,
 )
 te_data_0 = FieldsDataset(
-    data_path="../Data/coarse_grf_10k.npy",
+    data_path=coarse_data_path,
     train=False,
     transform=transform_coarse,
 )
 tr_data_1 = FieldsDataset(
-    data_path="../Data/fine_grf_10k.npy",
+    data_path=fine_data_path,
     train=True,
     transform=transform_fine,
 )
 te_data_1 = FieldsDataset(
-    data_path="../Data/fine_grf_10k.npy",
+    data_path=fine_data_path,
     train=False,
     transform=transform_fine,
 )
@@ -612,6 +608,7 @@ def run(
     consistency_loss_weight=1.0,  # Weight for the consistency loss term
     t_epsilon=1e-5,  # Avoid singularities by sampling t from (epsilon, 1-epsilon)
     use_checkpointing=True,
+    run_name=None,
 ):
     config = locals()
     assert isinstance(sigma, float) and sigma >= 0
@@ -708,6 +705,7 @@ def run(
                 "ema": ema,
             },  # dont need sample_nn, as we can use `ema` directly for sampling
             console,
+            run_name=wandb.run.name,
         )
         if rank == 0:
             console.log(f"Loaded checkpoint: iteration {start_iteration}, step {step}")
@@ -750,6 +748,7 @@ def run(
             with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
                 with torch.profiler.record_function("BM2_Stage1_ForwardBackward"):
                     # Predict both forward and backward drifts with the same network
+                    # The network can distinguish between forward and backward based on a direction flag
                     fwd_pred, _ = nn(x_t_forward, t, input_pos=None)
                     _, bwd_pred = nn(x_t_backward, t, input_pos=None)
 
@@ -830,6 +829,9 @@ def run(
                     # Update forward path endpoints
                     f_0_cache_batch = next(tr_cache_iter_0).to(device)
 
+                    # Update backward path endpoint
+                    b_1_cache_batch = next(tr_cache_iter_1).to(device)
+
                     # Compute chunk_size as the minimum between the number of available samples in x_0 and cache_batch_dim.
                     # This adaptive computation ensures that when the cache is nearly exhausted, we only process the remaining samples.
                     chunk_size = int(min(f_0_cache_batch.size(0), cache_batch_dim / 4))
@@ -847,25 +849,6 @@ def run(
                     )
                     fwd_traj[0] = f_0_cache_batch  # Set initial condition
 
-                    # Use euler_discretization to simulate forward process
-                    drift_norms, _ = euler_discretization(
-                        x=fwd_traj,
-                        # nn=sample_nn,
-                        nn=ema,
-                        energy=sigma,
-                        chunk_size=chunk_size,
-                        store_control=False,
-                        reverse=False,
-                        direction_fn="bwd",
-                    )
-                    f_1_cache_batch = fwd_traj[-1]
-
-                    fwd_cache_x0 = f_0_cache_batch
-                    fwd_cache_x1 = f_1_cache_batch.detach()
-
-                    # Update backward path endpoint
-                    b_1_cache_batch = next(tr_cache_iter_1).to(device)
-
                     # Initialize trajectory array
                     bwd_traj = th.zeros(
                         (
@@ -879,34 +862,46 @@ def run(
 
                     # Use euler_discretization to simulate backward process
                     drift_norms, _ = euler_discretization(
+                        x=fwd_traj,
+                        # nn=sample_nn,
+                        nn=ema,
+                        energy=sigma,
+                        chunk_size=chunk_size,
+                        store_control=False,
+                        direction_fn="fwd",
+                    )
+                    # backward iteration, we simulate the forward, and then reverse the path
+                    bwd_cache_x0 = fwd_traj[-1].detach()
+                    bwd_cache_x1 = fwd_traj[0]
+
+                    # Use euler_discretization to simulate forward process
+                    drift_norms, _ = euler_discretization(
                         x=bwd_traj,
                         # nn=sample_nn,
                         nn=ema,
                         energy=sigma,
                         chunk_size=chunk_size,
                         store_control=False,
-                        reverse=False,
-                        direction_fn="fwd",
+                        direction_fn="bwd",
                     )
-                    b_0_cache_batch = bwd_traj[-1]
 
-                    bwd_cache_x0 = b_1_cache_batch
-                    bwd_cache_x1 = b_0_cache_batch.detach()
+                    fwd_cache_x0 = bwd_traj[-1].detach()
+                    fwd_cache_x1 = bwd_traj[0]
 
                 # Randomly select samples from cache
-                fwd_idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
-                bwd_idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
+                idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
+                # bwd_idx = th.randperm(cache_batch_dim, device=device)[:batch_dim]
 
                 # Get forward path endpoints
-                f_0 = fwd_cache_x0[fwd_idx]
-                f_1 = fwd_cache_x1[fwd_idx]
+                f_0 = fwd_cache_x0[idx]
+                f_1 = fwd_cache_x1[idx]
 
                 # Get backward path endpoints
                 b_1 = bwd_cache_x0[
-                    bwd_idx
+                    idx
                 ]  # consistent naming with the paper, b_1 is the fine field
                 b_0 = bwd_cache_x1[
-                    bwd_idx
+                    idx
                 ]  # consistent naming with the paper, b_0 is the coarse field
 
         return f_0, f_1, b_1, b_0
@@ -935,18 +930,18 @@ def run(
                 + t_epsilon
             )
 
-            pi_f_t = sample_bridge(x_0=b_0, x_1=b_1, t=t, energy=sigma)
-            pi_b_t = sample_bridge(x_0=f_0, x_1=f_1, t=t, energy=sigma)
+            pi_f_t = sample_bridge(x_0=f_0, x_1=f_1, t=t, energy=sigma)
+            pi_b_t = sample_bridge(x_0=b_1, x_1=b_0, t=t, energy=sigma)
 
             # Compute targets and model predictions
             with th.autocast(device_type="cuda", dtype=th.float16, enabled=True):
                 with torch.profiler.record_function("BM2_Training_ForwardBackward"):
                     # # Forward targets and predictions
-                    target_f_t = fwd_target(x_t=pi_b_t, x_1=b_1, t=None)
+                    target_f_t = fwd_target(x_t=pi_b_t, x_1=f_1, t=None)
                     prediction_f_t, _ = nn(pi_f_t, t, input_pos=None)
 
                     # Backward targets and predictions
-                    target_b_t = bwd_target(x_t=pi_f_t, x_0=f_0, t=None)
+                    target_b_t = bwd_target(x_t=pi_f_t, x_0=b_0, t=None)
                     _, prediction_b_t = nn(pi_b_t, t, input_pos=None)
 
                     # Compute the BM² coupled loss
@@ -962,7 +957,7 @@ def run(
                         # f_1 is the fine field (generated by the forward model)
                         # and target_b_t is the coarse field f_0.
                         losses_intOperator = (
-                            target_b_t - coarsen_field(f_1, downsample_factor=1)
+                            target_b_t - coarsen_field(b_1, downsample_factor=1)
                         ) ** 2
 
                         # print("losses_intOperator", losses_intOperator)
@@ -1029,11 +1024,33 @@ def run(
                 # Update sample_nn with latest EMA parameters
                 # ema.ema(sample_nn)
 
+                saves = [nn, ema, optim]
+                run_name = wandb.run.name
+                save_checkpoint(saves, step, console, run_name)
+
+                # Determine the checkpoint file path (as used in save_checkpoint)
+                checkpoint_file = os.path.join(
+                    BASE_DIR,
+                    f"./checkpoint/{run_name}_BM2_dbfs_grf_10k_256_intOp_scaled_2.npz",
+                )
+
+                # Create a wandb Artifact for the model checkpoint.
+                # Using a consistent artifact name will allow wandb to version control it.
+                model_artifact = wandb.Artifact(
+                    f"{run_name}_model_checkpoint",
+                    type="model_checkpoint",
+                    description=f"Model checkpoint for {run_name} at step {step}",
+                )
+                # Add the checkpoint file to the artifact.
+                model_artifact.add_file(checkpoint_file)
+                # Log the artifact (wandb will automatically version it).
+                wandb.log_artifact(model_artifact)
+
                 # Evaluate on test set
                 with th.no_grad():
-                    test_loss_fwd = 0.0
-                    test_loss_bwd = 0.0
-                    test_loss_intOperator = 0.0
+                    test_loss_fwd = []
+                    test_loss_bwd = []
+                    test_loss_intOperator = []
                     num_batches = 0
 
                     for f_0_test, b_1_test in zip(te_loader_0, te_loader_1):
@@ -1079,8 +1096,7 @@ def run(
                             energy=sigma,
                             chunk_size=f_0_test.shape[0],
                             store_control=False,
-                            reverse=False,
-                            direction_fn="bwd",
+                            direction_fn="fwd",
                         )
                         f_1_test = fwd_traj[-1]
 
@@ -1092,85 +1108,99 @@ def run(
                             energy=sigma,
                             chunk_size=b_1_test.shape[0],
                             store_control=False,
-                            reverse=False,
-                            direction_fn="fwd",
+                            direction_fn="bwd",
                         )
                         b_0_test = bwd_traj[-1]
 
-                        # Sample bridge points
-                        # forward, in dbfs its (x_0 = coarse (euler), x_1 = fine (not euler))
-                        ## Note ##
-                        #! f_0_test is coarse from cache, f_1_test is fine from euler discretization
-                        #! b_1_test is fine from cache, b_0_test is coarse from euler discretization
-                        pi_f_t_test = sample_bridge(
-                            x_0=b_0_test, x_1=b_1_test, t=t_test, energy=sigma
+                        # Denormalize using the corresponding dataset denormalizers
+                        denorm_fine = DatasetDenormalization(
+                            fine_normalizer.mean, fine_normalizer.std
+                        )
+                        denorm_coarse = DatasetDenormalization(
+                            coarse_normalizer.mean, coarse_normalizer.std
                         )
 
-                        # backward, in dbfs its (x_0 = fine (euler), x_1 = coarse (not euler))
-                        pi_b_t_test = sample_bridge(
-                            x_0=f_1_test, x_1=f_0_test, t=t_test, energy=sigma
+                        # Apply denormalization to the outputs/targets
+                        f_1_test_denorm = denorm_fine(f_1_test)
+                        b_1_test_denorm = denorm_fine(b_1_test)
+                        b_0_test_denorm = denorm_coarse(b_0_test)
+                        f_0_test_denorm = denorm_coarse(f_0_test)
+
+                        # Then compute relative errors in physical (denormalized) units:
+                        rel_err_f_test = th.norm(
+                            (f_1_test_denorm - b_1_test_denorm).reshape(
+                                f_1_test_denorm.shape[0], -1
+                            ),
+                            p=2,
+                            dim=1,
+                        ) / th.norm(
+                            b_1_test_denorm.reshape(b_1_test_denorm.shape[0], -1),
+                            p=2,
+                            dim=1,
                         )
 
-                        # Compute targets
-                        target_f_t_test = fwd_target(
-                            pi_b_t_test, b_1_test, t=None
-                        )  # forward target,
-                        target_b_t_test = bwd_target(
-                            pi_f_t_test, f_0_test, t=None
-                        )  # backward target
-
-                        # Model predictions
-                        # pred_f_t_test, _ = ema(
-                        #     pi_b_t_test, t_test, input_pos=None
-                        # )
-                        # _, pred_b_t_test = ema(
-                        #     pi_f_t_test, t_test, input_pos=None
-                        # )
-
-                        pred_f_t_test, _ = ema(pi_f_t_test, t_test, input_pos=None)
-                        _, pred_b_t_test = ema(pi_b_t_test, t_test, input_pos=None)
-
-                        # Compute test losses (MSE)
-                        loss_f_test = th.mean((target_f_t_test - pred_f_t_test) ** 2)
-                        loss_b_test = th.mean((target_b_t_test - pred_b_t_test) ** 2)
+                        rel_err_b_test = th.norm(
+                            (b_0_test_denorm - f_0_test_denorm).reshape(
+                                b_0_test_denorm.shape[0], -1
+                            ),
+                            p=2,
+                            dim=1,
+                        ) / th.norm(
+                            f_0_test_denorm.reshape(f_0_test_denorm.shape[0], -1),
+                            p=2,
+                            dim=1,
+                        )
 
                         if intOp_scale_factor > 0:
-                            loss_intOperator = th.mean(
+                            # For the integral operator, compare the coarsened f_1_test with f_0_test:
+                            rel_err_int = th.norm(
                                 (
-                                    target_b_t_test
-                                    - coarsen_field(f_1_test, downsample_factor=1)
-                                )
-                                ** 2
+                                    coarsen_field(f_1_test_denorm, downsample_factor=1)
+                                    - f_0_test_denorm
+                                ).reshape(f_0_test_denorm.shape[0], -1),
+                                p=2,
+                                dim=1,
+                            ) / th.norm(
+                                f_0_test_denorm.reshape(f_0_test_denorm.shape[0], -1),
+                                p=2,
+                                dim=1,
                             )
+                            rel_err_int = rel_err_int.mean()
                         else:
-                            loss_intOperator = torch.tensor(0.0, device=device)
+                            rel_err_int = torch.tensor(0.0, device=device)
 
-                        test_loss_fwd += loss_f_test.item()
-                        test_loss_bwd += loss_b_test.item()
-                        test_loss_intOperator += loss_intOperator.item()
-                        num_batches += 1
+                        test_loss_fwd.append(rel_err_f_test)
+                        test_loss_bwd.append(rel_err_b_test)
+                        test_loss_intOperator.append(rel_err_int)
 
-                    test_loss_fwd = test_loss_fwd / num_batches
-                    test_loss_bwd = test_loss_bwd / num_batches
-                    test_loss_intOperator = test_loss_intOperator / num_batches
+                    test_loss_fwd = th.stack(test_loss_fwd)
+                    test_loss_bwd = th.stack(test_loss_bwd)
+                    test_loss_intOperator = th.stack(test_loss_intOperator)
+
+                    test_loss_fwd = test_loss_fwd.mean()
+                    test_loss_bwd = test_loss_bwd.mean()
+                    test_loss_intOperator = test_loss_intOperator.mean()
 
                     if rank == 0:
-                        console.log(f"Test forward MSE loss: {test_loss_fwd:.6f}")
-                        console.log(f"Test backward MSE loss: {test_loss_bwd:.6f}")
                         console.log(
-                            f"Test intOperator loss: {intOp_scale_factor * test_loss_intOperator:.6f}"
+                            f"Test mean relative L2 error forward: {test_loss_fwd:.6f}"
+                        )
+                        console.log(
+                            f"Test mean relative L2 error backward: {test_loss_bwd:.6f}"
+                        )
+                        console.log(
+                            f"Test mean relative L2 error intOperator: {intOp_scale_factor * test_loss_intOperator:.6f}"
                         )
 
                         wandb.log(
                             {
-                                "bm2/test/total_fwd_loss": test_loss_fwd
-                                + intOp_scale_factor * test_loss_intOperator,
-                                "bm2/test/total_bwd_loss": test_loss_bwd,
-                                "bm2/test/total_loss": test_loss_fwd
+                                "bm2/test/mean_rel_err_fwd": test_loss_fwd,
+                                "bm2/test/mean_rel_err_bwd": test_loss_bwd,
+                                "bm2/test/mean_rel_err_intOp": intOp_scale_factor
+                                * test_loss_intOperator,
+                                "bm2/test/mean_rel_err_total": test_loss_fwd
                                 + test_loss_bwd
                                 + intOp_scale_factor * test_loss_intOperator,
-                                "bm2/test/intOp_loss": intOp_scale_factor
-                                * test_loss_intOperator,
                             },
                             step=step,
                         )
@@ -1211,7 +1241,6 @@ def run(
                                     energy=sigma,
                                     chunk_size=te_x_0.shape[0],
                                     store_control=True,
-                                    reverse=False,
                                     direction_fn="fwd",
                                 )
                                 break
@@ -1264,21 +1293,15 @@ def run(
                             )
                             drift_norm = []
 
-                            for te_x_1, te_x_0 in zip(te_loader_1, te_loader_0):
-                                te_x_1 = F.resize(te_x_1, 64).to(device)
-                                te_x_0 = F.resize(te_x_0, 64).to(device)
-
-                                te_s_path[0] = te_x_1
-                                drift_norm, te_p_path = euler_discretization(
-                                    x=te_s_path,
-                                    nn=ema,
-                                    energy=sigma,
-                                    chunk_size=te_x_1.shape[0],
-                                    store_control=True,
-                                    reverse=False,
-                                    direction_fn="bwd",
-                                )
-                                break
+                            te_s_path[0] = te_x_1
+                            drift_norm, te_p_path = euler_discretization(
+                                x=te_s_path,
+                                nn=ema,
+                                energy=sigma,
+                                chunk_size=te_x_1.shape[0],
+                                store_control=True,
+                                direction_fn="bwd",
+                            )
 
                             # Log drift norm
                             if rank == 0:
@@ -1325,12 +1348,15 @@ def run(
     return nn
 
 
-def save_checkpoint(saves, iteration, console):
+def save_checkpoint(saves, iteration, console, run_name):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
     checkpoint = {}
     i = 0
-    fn = "./checkpoint/BM2_grf_10k_256_intOp_scaled.npz"
-    keys = ["bwd_nn", "bwd_ema", "bwd_optim", "fwd_nn", "fwd_ema", "fwd_optim"]
+    # Include run name in the file name:
+    fn = os.path.join(
+        BASE_DIR, f"./checkpoint/{run_name}_BM2_dbfs_grf_10k_256_intOp_scaled_2.npz"
+    )
+    keys = ["nn", "ema", "optim"]
 
     with th.cuda.device(rank):
         for k in keys:
@@ -1342,10 +1368,12 @@ def save_checkpoint(saves, iteration, console):
         console.log(f"checkpoint saved: {fn}")
 
 
-def restore_checkpoint(saves, console):
+def restore_checkpoint(saves, console, run_name):
     # Simplified from https://github.com/ghliu/SB-FBSDE/blob/main/util.py:
-    i = 0
-    load_name = "./checkpoint/BM2_grf_10k_256_intOp_scaled.npz"
+    # Use the run name in the load path:
+    load_name = os.path.join(
+        BASE_DIR, f"./checkpoint/{run_name}_BM2_dbfs_grf_10k_256_intOp_scaled_2.npz"
+    )
     assert load_name is not None
     if rank == 0:
         console.log(f"#loading checkpoint {load_name}...")
@@ -1354,8 +1382,8 @@ def restore_checkpoint(saves, console):
         checkpoint = th.load(load_name, map_location=th.device("cuda:%d" % rank))
         ckpt_keys = [*checkpoint.keys()][:-1]
         for k in ckpt_keys:
-            saves[i].load_state_dict(checkpoint[k])
-            i += 1
+            print("k", k)
+            saves[k].load_state_dict(checkpoint[k])
     if rank == 0:
         console.log("#successfully loaded all the modules")
 
@@ -1363,51 +1391,68 @@ def restore_checkpoint(saves, console):
 
 
 if __name__ == "__main__":
-    config = {
-        "in_axis": 2,
-        "out_axis": 2,
-        "batch_dim": 128,  # Increased for better GPU utilization
-        "cache_batch_dim": 2560,  #
-        # "cache_batch_dim": 512,  #
-        "cache_steps": 250,
-        # "cache_steps": 2,
-        "test_steps": 5000,
-        "iterations": 30,
-        # "iterations": 3,
-        "training_steps": 5000,
-        # "training_steps": 4,
-        "load": False,  # continue training
-        "intOp_scale_factor": 0.1,
-        "two_stage_training": False,
-        "use_checkpointing": True,
-    }
+    import argparse
 
-    # # Reduced config parameters for a quick profiling run
-    # config = {
-    #     "in_axis": 2,
-    #     "out_axis": 2,
-    #     "batch_dim": 128,
-    #     "cache_batch_dim": 2560,
-    #     "cache_steps": 10,  # Reduced number for profiling purposes
-    #     "test_steps": 1000,  # Adjust test steps if needed
-    #     "iterations": 2,  # Run only one iteration for profiling
-    #     "training_steps": 10,  # Run only a few training steps
-    #     "load": False,
-    #     "intOp_scale_factor": 0.1,
-    #     "two_stage_training": False,
-    # }
+    parser = argparse.ArgumentParser(
+        description="Train BM2_FS model with integral operator scaling and checkpointing"
+    )
+    parser.add_argument(
+        "--in_axis", type=int, default=2, help="Input axis (default: 2)"
+    )
+    parser.add_argument(
+        "--out_axis", type=int, default=2, help="Output axis (default: 2)"
+    )
+    parser.add_argument(
+        "--batch_dim",
+        type=int,
+        default=128,
+        help="Batch dimension (increased for better GPU utilization)",
+    )
+    parser.add_argument(
+        "--cache_batch_dim", type=int, default=2560, help="Cache batch dimension"
+    )
+    parser.add_argument(
+        "--cache_steps", type=int, default=250, help="Number of cache steps"
+    )
+    parser.add_argument(
+        "--test_steps", type=int, default=5000, help="Number of test steps"
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=30, help="Number of iterations"
+    )
+    parser.add_argument(
+        "--training_steps", type=int, default=5000, help="Number of training steps"
+    )
+    parser.add_argument(
+        "--load", type=bool, default=False, help="Continue training from checkpoint"
+    )
+    parser.add_argument(
+        "--intOp_scale_factor",
+        type=float,
+        default=1,
+        help="Integral operator scale factor",
+    )
+    parser.add_argument(
+        "--two_stage_training", action="store_true", help="Enable two-stage training"
+    )
+    parser.add_argument(
+        "--use_checkpointing",
+        action="store_true",
+        default=True,
+        help="Use checkpointing during training",
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Run name to load checkpoint from if resuming training.",
+    )
+    args = parser.parse_args()
 
-    # fire.Fire(run(**config))
-    # with torch.profiler.profile(
-    #     activities=[
-    #         torch.profiler.ProfilerActivity.CPU,
-    #         torch.profiler.ProfilerActivity.CUDA,
-    #     ],
-    #     record_shapes=True,
-    #     profile_memory=True,
-    # ) as prof:
-    #     # fire.Fire(run(**config))
-    #     run(**config)
-    # print(prof.key_averages().table(sort_by="self_cpu_time_total"))
-    # prof.export_chrome_trace("trace.json")
-    run(**config)
+    if args.run_name is not None:
+        # Use the provided run name for checkpoint naming and restoration.
+        run_name = args.run_name
+        print(f"Resuming from checkpoint of run: {run_name}")
+
+    # Pass the run_name to functions that use it so that the proper checkpoint can be located.
+    run(**vars(args))

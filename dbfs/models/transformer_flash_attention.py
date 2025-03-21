@@ -7,6 +7,12 @@ from functools import wraps
 import numpy as np
 from einops import rearrange, repeat
 from torch.amp import autocast, GradScaler
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from einops._torch_specific import allow_ops_in_compiled_graph  # requires einops>=0.6.1
+
+allow_ops_in_compiled_graph()
+
+torch.backends.cuda.enable_flash_sdp(enabled=True)
 
 
 def exists(val):
@@ -63,11 +69,13 @@ class GaussianFourierFeatureTransform(torch.nn.Module):
         batches, num_of_points, channels = x.shape
         # From [B, N, C] to [(B*N), C].
         x = rearrange(x, "b n c -> (b n) c")
+        # x = x.view(batches * num_of_points, channels)
 
         x = x @ self._B.to(x.device)
 
         # From [(B*W*H), C] to [B, W, H, C]
         x = rearrange(x, "(b n) c -> b n c", b=batches)
+        # x = x.reshape(batches, num_of_points, x.size(-1))
 
         x = 2 * np.pi * x
 
@@ -92,7 +100,9 @@ class TimestepEmbedder(nn.Module):
         self.max_cache_size = 1000  # Limit cache size to prevent memory issues
 
     @staticmethod
-    def _compute_timestep_embedding(t, dim, max_period=10000):
+    def _compute_timestep_embedding(
+        t: torch.Tensor, dim: int, max_period: float = 10000.0
+    ):
         """
         Raw computation of sinusoidal timestep embeddings without caching.
         """
@@ -110,7 +120,9 @@ class TimestepEmbedder(nn.Module):
             )
         return embedding
 
-    def timestep_embedding(self, t, dim, max_period=10000):
+    def timestep_embedding(
+        self, t: torch.Tensor, dim: int, max_period: float = 10000.0
+    ):
         """
         Create sinusoidal timestep embeddings with caching for efficiency.
 
@@ -123,32 +135,7 @@ class TimestepEmbedder(nn.Module):
         :param max_period: controls the minimum frequency of the embeddings.
         :return: an (N, D) Tensor of positional embeddings.
         """
-        # Only cache scalar timesteps
-        if t.shape[0] == 1 or (t[0] == t).all():
-            # Use the first element as key since all values are the same
-            key = (float(t[0].item()), dim, max_period, t.device)
-
-            if key in self.embedding_cache:
-                # If all timesteps are the same and we have it cached, return cached value
-                cached_embedding = self.embedding_cache[key]
-                if cached_embedding.shape[0] != t.shape[0]:
-                    return cached_embedding.repeat(t.shape[0], 1)
-                return cached_embedding
-
-            # Compute embedding
-            embedding = self._compute_timestep_embedding(t, dim, max_period)
-
-            # Manage cache size
-            if len(self.embedding_cache) >= self.max_cache_size:
-                # Simple strategy: clear the entire cache when it gets too big
-                self.embedding_cache = {}
-
-            # Cache the result
-            self.embedding_cache[key] = embedding
-            return embedding
-        else:
-            # For varied timesteps, don't use cache
-            return self._compute_timestep_embedding(t, dim, max_period)
+        return self._compute_timestep_embedding(t, dim, max_period)
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
@@ -258,11 +245,8 @@ class FlashAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=True)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=True)
 
-        self.dropout = dropout
+        self.dropout = float(dropout)
         self.to_out = nn.Linear(inner_dim, query_dim)
-
-        # Check if flash attention is available
-        self.has_flash_attn = hasattr(F, "scaled_dot_product_attention")
 
     def forward(self, x):
         """
@@ -275,17 +259,21 @@ class FlashAttention(nn.Module):
             output: Self-attention output of shape [batch_size, sequence_length, query_dim]
         """
         h = self.heads
-
         # Project inputs to queries, keys, and values
         q = self.to_q(x)
         context = x
         k, v = self.to_kv(context).chunk(2, dim=-1)
 
-        # Reshape for multi-head attention
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+        # Reshape for multi-head attention using view and permute as an alternative to reshape
+        q = rearrange(q, "b n (h d) -> b h n d", h=h)
+        k = rearrange(k, "b n (h d) -> b h n d", h=h)
+        v = rearrange(v, "b n (h d) -> b h n d", h=h)
 
         # Use PyTorch's Flash Attention if available, otherwise use memory-efficient implementation
-        if self.has_flash_attn:
+        with (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16),
+            torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION),
+        ):
             attn_output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -294,11 +282,16 @@ class FlashAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=False,
             )
-        else:
-            attn_output = self.memory_efficient_attention(q, k, v)
 
         # Reshape and project to output dimension
         out = rearrange(attn_output, "b h n d -> b n (h d)")
+        # out = (
+        #     attn_output.permute(0, 2, 1, 3)
+        #     .contiguous()
+        #     .view(batches, num_of_points, channels)
+        # )
+        # Cast the output to the same dtype as the linear layer's weights
+        out = out.to(self.to_out.weight.dtype)
         return self.to_out(out)
 
 
@@ -336,11 +329,8 @@ class FlashCrossAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=True)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=True)
 
-        self.dropout = dropout
+        self.dropout = float(dropout)
         self.to_out = nn.Linear(inner_dim, query_dim)
-
-        # Check if flash attention is available
-        self.has_flash_attn = hasattr(F, "scaled_dot_product_attention")
 
     def forward(self, x, context=None):
         """
@@ -365,9 +355,18 @@ class FlashCrossAttention(nn.Module):
 
         # Reshape for multi-head attention
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+        # batches, num_of_points, channels = x.shape
+        # # Reshape for multi-head attention using view and permute as an alternative to reshape
+        # d = q.size(-1) // h
+        # q = q.view(q.size(0), q.size(1), h, d).permute(0, 2, 1, 3)
+        # k = k.view(k.size(0), k.size(1), h, d).permute(0, 2, 1, 3)
+        # v = v.view(v.size(0), v.size(1), h, d).permute(0, 2, 1, 3)
 
         # Use PyTorch's Flash Attention if available, otherwise use memory-efficient implementation
-        if self.has_flash_attn:
+        with (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16),
+            torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION),
+        ):
             attn_output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -376,11 +375,15 @@ class FlashCrossAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=False,
             )
-        else:
-            attn_output = self.memory_efficient_attention(q, k, v)
-
         # Reshape and project to output dimension
         out = rearrange(attn_output, "b h n d -> b n (h d)")
+        # out = (
+        #     attn_output.permute(0, 2, 1, 3)
+        #     .contiguous()
+        #     .view(batches, num_of_points, channels)
+        # )
+        # Cast the output to the same dtype as the linear layer's weights
+        out = out.to(self.to_out.weight.dtype)
         return self.to_out(out)
 
 
@@ -502,6 +505,8 @@ class OperatorTransformer(nn.Module):
 
     def __init__(
         self,
+        in_axis,
+        out_axis,
         in_channel,
         out_channel,
         pos_dim,
@@ -517,6 +522,8 @@ class OperatorTransformer(nn.Module):
         Initialize the OperatorTransformer model.
 
         Args:
+            in_axis: Number of input axes, e.g. 2 for 2D data
+            out_axis: Number of output axes, e.g. 2 for 2D data
             in_channel: Number of input channels
             out_channel: Number of output channels
             pos_dim: Dimension of positional encodings
@@ -531,6 +538,8 @@ class OperatorTransformer(nn.Module):
         super().__init__()
 
         self.locals = [
+            in_axis,
+            out_axis,
             in_channel,
             out_channel,
             pos_dim,
@@ -545,7 +554,8 @@ class OperatorTransformer(nn.Module):
 
         self.num_heads = num_heads
         cross_heads = num_heads
-        self.input_axis = in_channel
+        self.input_axis = in_axis
+        self.output_axis = out_axis
         self.hidden_size = latent_dim
 
         # Gaussian Fourier Feature Transform for 2D positions
@@ -553,7 +563,10 @@ class OperatorTransformer(nn.Module):
         self.latents = nn.Parameter(torch.randn(latent_dim, latent_dim))
 
         # Create embedder for input data (called x_embedder in transformer.py)
-        self.x_embedder = nn.Linear(out_channel, latent_dim, bias=True)
+        # This takes the input data that is reshaped (with spatial dimensions flattened) to have the input axes as the last dimension
+        # and embeds it to the latent dimension
+        # i.e. takes data of shape (b, (h w), c) and embeds it to the latent dimension
+        self.x_embedder = nn.Linear(in_channel, latent_dim, bias=True)
 
         # Rename for consistency with transformer.py
         self.time_embedder = TimestepEmbedder(latent_dim)
@@ -680,7 +693,7 @@ class OperatorTransformer(nn.Module):
         queries = self.query_embedder(output_pos, t_emb)
 
         # Step 6: Initialize latent representation
-        x = repeat(self.latents, "n d -> b n d", b=b)
+        x = self.latents.repeat(b, 1, 1)
         c = t_emb
 
         # Step 7: Process through encoder blocks
@@ -767,6 +780,8 @@ class OperatorTransformer_1d(nn.Module):
 
     def __init__(
         self,
+        in_axis,
+        out_axis,
         in_channel,
         out_channel,
         pos_dim,
@@ -782,6 +797,8 @@ class OperatorTransformer_1d(nn.Module):
         Initialize the OperatorTransformer_1d model.
 
         Args:
+            in_axis: Number of input axes, e.g. 2 for 2D data
+            out_axis: Number of output axes, e.g. 2 for 2D data
             in_channel: Number of input channels
             out_channel: Number of output channels
             pos_dim: Dimension of positional encodings
@@ -796,6 +813,8 @@ class OperatorTransformer_1d(nn.Module):
         super().__init__()
 
         self.locals = [
+            in_axis,
+            out_axis,
             in_channel,
             out_channel,
             pos_dim,
@@ -808,9 +827,12 @@ class OperatorTransformer_1d(nn.Module):
             height,
         ]
 
+        self.in_channel = in_channel
+        self.out_channel = out_channel
         self.num_heads = num_heads
         cross_heads = num_heads
-        self.input_axis = in_channel
+        self.input_axis = in_axis
+        self.output_axis = out_axis
         self.hidden_size = latent_dim
         # GFFT is no longer used for positional encoding
         self.height = height
@@ -860,10 +882,8 @@ class OperatorTransformer_1d(nn.Module):
         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
 
         # Initialize query embedder MLP:
-        nn.init.normal_(self.query_embedder.mlp_pos_emb[0].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp_pos_emb[2].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.query_embedder.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.query_embedder.mlp.fc1.weight, std=0.02)
+        nn.init.normal_(self.query_embedder.mlp.fc2.weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.decoder_blocks:
@@ -898,14 +918,28 @@ class OperatorTransformer_1d(nn.Module):
         Returns:
             output: Processed output tensor of shape [batch_size, out_channels, sequence_length]
         """
-        # Rearrange data from [batch, channels, sequence] to [batch, sequence, channels]
-        data = rearrange(data, "b c l -> b l c")
-        latent_dim = self.hidden_size
+        # Expect input data to be 3D tensor in either (batch, channels, sequence) or (batch, sequence, channels) format
+        if data.dim() != 3:
+            raise ValueError("OperatorTransformer_1d expects a 3D tensor as input")
 
-        # Step 1: Generate timestep embeddings for conditioning
+        # If the last dimension matches in_channel, assume input is already in (batch, sequence, channels) format
+        if data.size(-1) == self.in_channel:
+            pass
+        # If the second dimension matches in_channel, assume input is in (batch, channels, sequence) format and rearrange
+        elif data.size(1) == self.in_channel:
+            data = rearrange(data, "b c l -> b l c")
+        else:
+            raise ValueError(
+                "Input tensor shape does not match expected channel dimension"
+            )
+
+        latent_dim = self.hidden_size
         t_emb = self.time_embedder(t)
         batch_size, seq_length, feature_size = data.shape
         device = data.device
+
+        # Step 1: Generate timestep embeddings for conditioning
+        t_emb = self.time_embedder(t)
 
         # Step 2: Create positional encodings
         # Generate 1D positional encodings similar to transformer.py
@@ -1034,7 +1068,8 @@ if __name__ == "__main__":
     # Compile with TorchScript JIT for faster inference
     # Note: might not work for all models due to dynamic control flow
     try:
-        compiled_model = jit_compile_model(model)
+        # compiled_model = jit_compile_model(model)
+        compiled_model = torch.compile(model)
         with torch.no_grad():
             start_time = torch.cuda.Event(enable_timing=True)
             end_time = torch.cuda.Event(enable_timing=True)
@@ -1070,3 +1105,83 @@ if __name__ == "__main__":
                 print("✗ Warning: JIT compilation changed model outputs")
     except Exception as e:
         print(f"JIT compilation test failed: {e}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Model and input parameters
+    batch_size = 128
+    in_channel = 2
+    out_channel = 1
+    latent_dim = 512
+    pos_dim = 1
+    num_heads = 4
+    depth_enc = 6
+    depth_dec = 1
+    scale = 1
+    self_per_cross_attn = 1
+    height = 32  # Use a larger grid resolution (128x128) for testing
+
+    # Instantiate the 2D operator transformer.
+    # Note: OperatorTransformer expects an input of shape [batch, channels, height, width]
+    model = OperatorTransformer(
+        in_channel=in_channel,
+        out_channel=out_channel,
+        pos_dim=pos_dim,
+        latent_dim=latent_dim,
+        num_heads=num_heads,
+        depth_enc=depth_enc,
+        depth_dec=depth_dec,
+        scale=scale,
+        self_per_cross_attn=self_per_cross_attn,
+        height=height,
+    ).to(device)
+
+    # Create a larger 2D input tensor; shape: [batch, channels, height, width]
+    x = torch.rand(batch_size, in_channel, height, height).to(device)
+    t = torch.rand(batch_size).to(device)
+
+    # Warm-up runs for the original model
+    with torch.no_grad(), autocast(enabled=True, device_type=device):
+        for _ in range(10):
+            _ = model(x, t)
+
+    # Timing for the original model using torch.cuda.Event
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    # torch.cuda.synchronize()
+    # start.record()
+    # with torch.no_grad(), autocast(enabled=True, device_type=device):
+    #     for _ in range(100):
+    #         _ = model(x, t)
+    # end.record()
+    # torch.cuda.synchronize()
+    # time_original = start.elapsed_time(end)  # Total time in ms for 100 runs
+    # avg_time_original = time_original / 100.0
+    # print(
+    #     "Original model average inference time per run: {:.3f} ms".format(avg_time_original)
+    # )
+
+    # JIT compile the model
+    # compiled_model = jit_compile_model(model)
+    compiled_model = torch.compile(model)
+
+    # Warm-up runs for the JIT compiled model
+    with torch.no_grad(), autocast(enabled=True, device_type=device):
+        for _ in range(10):
+            _ = compiled_model(x, t)
+
+    # Timing for the JIT compiled model
+    torch.cuda.synchronize()
+    start.record()
+    with torch.no_grad(), autocast(enabled=True, device_type=device):
+        for _ in range(100):
+            _ = compiled_model(x, t)
+    end.record()
+    torch.cuda.synchronize()
+    time_compiled = start.elapsed_time(end)  # Total time in ms for 100 runs
+    avg_time_compiled = time_compiled / 100.0
+    print(
+        "JIT compiled model average inference time per run: {:.3f} ms".format(
+            avg_time_compiled
+        )
+    )

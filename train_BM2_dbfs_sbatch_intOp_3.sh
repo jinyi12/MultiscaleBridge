@@ -2,22 +2,19 @@
 #SBATCH -J dbfs_training  # Job name
 #SBATCH -o dbfs_training_%j.out  # Output file with job ID
 #SBATCH -e dbfs_training_%j.err  # Error file with job ID
-#SBATCH -p scavenger-gpu  # Partition (use gpu-common for GPU jobs)
+#SBATCH -p gpu-common  # Partition (use gpu-common for GPU jobs)
 #SBATCH --gres=gpu:5000_ada:1  # Request 1 GPU
-#SBATCH --mem=32G  # Request 30 GB of memory
+#SBATCH --mem=24G  # Request 24 GB of memory
 #SBATCH --time=48:00:00  # Maximum runtime (48 hours)
 #SBATCH --mail-type=BEGIN,END,FAIL     # Send email on job start, end, and fail
 #SBATCH --mail-user=jy384@duke.edu  # Email address to send notifications
 
-# Define scale factor (can be passed as argument to the script)
-SCALE_FACTOR=${1:-0.1}  # Default to 0.1 if not provided
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "Start time: $(date)"
 echo "Working directory: $(pwd)"
-echo "Scale Factor: $SCALE_FACTOR"
 
 # Print GPU information
 nvidia-smi
@@ -30,19 +27,19 @@ echo "Python version: $(python --version)"
 echo "Conda environment: $CONDA_DEFAULT_ENV"
 
 # Move into the directory
-cd /hpc/dctrl/jy384/MultiscaleBridge/dbfs
+# cd /hpc/dctrl/jy384/MultiscaleBridge/dbfs
 
-# Check directory structure
-echo "Current working directory:"
-pwd
-echo "Checking for Data directory:"
-ls -l ../Data
-echo "Contents of Data directory:"
-ls -l ../Data/*.npy
+# # Check directory structure
+# echo "Current working directory:"
+# pwd
+# echo "Checking for Data directory:"
+# ls -l ../Data
+# echo "Contents of Data directory:"
+# ls -l ../Data/*.npy
 
-# Run your Python script
+# Run Python script
 echo "Starting training script..."
-python dbfs_grf_256_intOp_optimized.py --intOp_scale_factor $SCALE_FACTOR
+python -m dbfs.BM2_dbfs_grf_256_intOp_optimized_3 --intOp_scale_factor 1
 
 # Print end time
 echo "End time: $(date)" 

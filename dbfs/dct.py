@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
 def dct(x, norm=None):
     """
     Discrete Cosine Transform, Type II (a.k.a. the DCT)
@@ -23,23 +24,23 @@ def dct(x, norm=None):
 
     v = torch.cat([x[:, ::2], x[:, 1::2].flip([1])], dim=1)
 
-    #Vc = torch.fft.rfft(v, 1)
+    # Vc = torch.fft.rfft(v, 1)
     Vc = torch.view_as_real(torch.fft.fft(v, dim=1))
-    
-    k = - torch.arange(N, dtype=x.dtype,
-                       device=x.device)[None, :] * np.pi / (2 * N)
+
+    k = -torch.arange(N, dtype=x.dtype, device=x.device)[None, :] * np.pi / (2 * N)
     W_r = torch.cos(k)
     W_i = torch.sin(k)
 
     V = Vc[:, :, 0] * W_r - Vc[:, :, 1] * W_i
 
-    if norm == 'ortho':
+    if norm == "ortho":
         V[:, 0] /= np.sqrt(N) * 2
         V[:, 1:] /= np.sqrt(N / 2) * 2
 
     V = 2 * V.view(*x_shape)
 
     return V
+
 
 def dct_shift(x, norm=None):
     """
@@ -56,17 +57,16 @@ def dct_shift(x, norm=None):
 
     v = torch.cat([x[:, ::2], x[:, 1::2].flip([1])], dim=1)
 
-    #Vc = torch.fft.rfft(v, 1)
+    # Vc = torch.fft.rfft(v, 1)
     Vc = torch.view_as_real(torch.fft.fftshift(torch.fft.fft(v, dim=1), dim=1))
-    
-    k = - torch.arange(N, dtype=x.dtype,
-                       device=x.device)[None, :] * np.pi / (2 * N)
+
+    k = -torch.arange(N, dtype=x.dtype, device=x.device)[None, :] * np.pi / (2 * N)
     W_r = torch.cos(k)
     W_i = torch.sin(k)
 
     V = Vc[:, :, 0] * W_r - Vc[:, :, 1] * W_i
 
-    if norm == 'ortho':
+    if norm == "ortho":
         V[:, 0] /= np.sqrt(N) * 2
         V[:, 1:] /= np.sqrt(N / 2) * 2
 
@@ -91,12 +91,15 @@ def idct(X, norm=None):
 
     X_v = X.contiguous().view(-1, x_shape[-1]) / 2
 
-    if norm == 'ortho':
+    if norm == "ortho":
         X_v[:, 0] *= np.sqrt(N) * 2
         X_v[:, 1:] *= np.sqrt(N / 2) * 2
 
-    k = torch.arange(x_shape[-1], dtype=X.dtype,
-                     device=X.device)[None, :] * np.pi / (2 * N)
+    k = (
+        torch.arange(x_shape[-1], dtype=X.dtype, device=X.device)[None, :]
+        * np.pi
+        / (2 * N)
+    )
     W_r = torch.cos(k)
     W_i = torch.sin(k)
 
@@ -108,13 +111,14 @@ def idct(X, norm=None):
 
     V = torch.cat([V_r.unsqueeze(2), V_i.unsqueeze(2)], dim=2)
 
-    #v = torch.fft.irfft(V, 1)
+    # v = torch.fft.irfft(V, 1)
     v = torch.fft.irfft(torch.view_as_complex(V), n=V.shape[1], dim=1)
     x = v.new_zeros(v.shape)
-    x[:, ::2] += v[:, :N - (N // 2)]
-    x[:, 1::2] += v.flip([1])[:, :N // 2]
+    x[:, ::2] += v[:, : N - (N // 2)]
+    x[:, 1::2] += v.flip([1])[:, : N // 2]
 
     return x.view(*x_shape)
+
 
 def idct_shift(X, norm=None):
     """
@@ -132,12 +136,15 @@ def idct_shift(X, norm=None):
 
     X_v = X.contiguous().view(-1, x_shape[-1]) / 2
 
-    if norm == 'ortho':
+    if norm == "ortho":
         X_v[:, 0] *= np.sqrt(N) * 2
         X_v[:, 1:] *= np.sqrt(N / 2) * 2
 
-    k = torch.arange(x_shape[-1], dtype=X.dtype,
-                     device=X.device)[None, :] * np.pi / (2 * N)
+    k = (
+        torch.arange(x_shape[-1], dtype=X.dtype, device=X.device)[None, :]
+        * np.pi
+        / (2 * N)
+    )
     W_r = torch.cos(k)
     W_i = torch.sin(k)
 
@@ -149,11 +156,13 @@ def idct_shift(X, norm=None):
 
     V = torch.cat([V_r.unsqueeze(2), V_i.unsqueeze(2)], dim=2)
 
-    #v = torch.fft.irfft(V, 1)
-    v = torch.fft.irfft(torch.fft.fftshift(torch.view_as_complex(V), dim=1), n=V.shape[1], dim=1)
+    # v = torch.fft.irfft(V, 1)
+    v = torch.fft.irfft(
+        torch.fft.fftshift(torch.view_as_complex(V), dim=1), n=V.shape[1], dim=1
+    )
     x = v.new_zeros(v.shape)
-    x[:, ::2] += v[:, :N - (N // 2)]
-    x[:, 1::2] += v.flip([1])[:, :N // 2]
+    x[:, ::2] += v[:, : N - (N // 2)]
+    x[:, 1::2] += v.flip([1])[:, : N // 2]
 
     return x.view(*x_shape)
 
@@ -170,6 +179,7 @@ def dct_2d(x, norm=None):
     X1 = dct(x, norm=norm)
     X2 = dct(X1.transpose(-1, -2), norm=norm)
     return X2.transpose(-1, -2)
+
 
 def dct_2d_shift(x, norm=None):
     """
@@ -199,6 +209,7 @@ def idct_2d(X, norm=None):
     x2 = idct(x1.transpose(-1, -2), norm=norm)
     return x2.transpose(-1, -2)
 
+
 def idct_2d_shift(X, norm=None):
     """
     The inverse to 2D DCT-II, which is a scaled Discrete Cosine Transform, Type III
@@ -212,5 +223,3 @@ def idct_2d_shift(X, norm=None):
     x1 = idct_shift(X, norm=norm)
     x2 = idct_shift(x1.transpose(-1, -2), norm=norm)
     return x2.transpose(-1, -2)
-
-
