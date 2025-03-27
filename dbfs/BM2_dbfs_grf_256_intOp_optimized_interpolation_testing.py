@@ -64,7 +64,7 @@ rng = np.random.default_rng(seed=0x87351080E25CB0FAD77A44A3BE03B491)
 # for greater multiple of h_e, H can be increased, e.g. H = 8 for L_c >= 8 * h_e.
 # experimentally, H = 12 is the best value for the current setup
 H = 12
-nx_fine = 64
+nx_fine = 32
 nx_coarse = 16
 nx_interpolation = 32
 
@@ -789,7 +789,7 @@ def run(
                     if intOp_scale_factor > 0:
                         # For forward direction: x_1 is the fine field, and bwd_target_t contains coarse field information
                         losses_intOperator = (
-                            bwd_target_t - coarsen_field(x_1, H=H, downsample_factor=4)
+                            bwd_target_t - coarsen_field(x_1, H=H, downsample_factor=2)
                         ) ** 2
                         losses_intOperator = th.mean(
                             losses_intOperator.reshape(losses_intOperator.shape[0], -1),
@@ -1008,7 +1008,7 @@ def run(
                     if intOp_scale_factor > 0 and iteration > 1:
                         # remember b_1 is the generated fine field, f_0_original is the original coarse field
                         losses_intOperator = (
-                            f_0_original - coarsen_field(b_1, H=H, downsample_factor=4)
+                            f_0_original - coarsen_field(b_1, H=H, downsample_factor=2)
                         ) ** 2
 
                         # print("losses_intOperator", losses_intOperator)
@@ -1214,7 +1214,7 @@ def run(
                             rel_err_int = th.norm(
                                 (
                                     coarsen_field(
-                                        f_1_test_denorm, H=H, downsample_factor=4
+                                        f_1_test_denorm, H=H, downsample_factor=2
                                     )
                                     - f_0_test_original_denorm
                                 ).reshape(f_0_test_denorm.shape[0], -1),
@@ -1316,16 +1316,14 @@ def run(
                                     antialias=True,
                                 ).squeeze(0)
 
-                                # te_x_1 = coarsen_field(
-                                #     te_x_1,
-                                #     H=H,
-                                #     downsample_factor=1,  # no change
-                                #     method="bicubic",
-                                #     apply_gaussian_smoothing=True,
-                                #     antialias=True,
-                                # ).to(device)
-
-                                te_x_1 = te_x_1.to(device)
+                                te_x_1 = coarsen_field(
+                                    te_x_1,
+                                    H=H,
+                                    downsample_factor=2,  # to 32x32 from 64x64
+                                    method="bicubic",
+                                    apply_gaussian_smoothing=True,
+                                    antialias=True,
+                                ).to(device)
 
                                 te_s_path[0] = te_x_0
                                 drift_norm, te_p_path = euler_discretization(

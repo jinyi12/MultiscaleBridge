@@ -11,6 +11,7 @@ References:
 
 import warnings
 import os
+import torch._dynamo.config
 import torchvision.transforms.functional as F
 import time
 
@@ -30,18 +31,22 @@ from rich.progress import (
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.utils import make_grid
-from .models.transformer import OperatorTransformer
+from .models.bm2_transformer_conditional import BM2TransformerConditional
 from .dct import dct_2d, idct_2d
 
 # DDP
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-from .models.bm2_transformer import BM2Transformer
 from einops import repeat, rearrange
 
+# memory budget for torch.compile
+print("Torch version:", torch.__version__)
+torch._functorch.config.activation_memory_budget = 0.6
+
+
 warnings.filterwarnings("ignore")
+
 
 # EMA
 from ema_pytorch import EMA
@@ -264,12 +269,7 @@ def consistency_target(x_t, x_0, x_1, t):
 
 
 def euler_discretization(
-    x,
-    nn,
-    energy,
-    chunk_size=128,
-    store_control=False,
-    direction_fn="fwd",
+    x, nn, energy, chunk_size=128, store_control=False, direction=1
 ):
     """
     Performs an Euler–Maruyama discretization of the SDE controlling the process.
@@ -280,9 +280,7 @@ def euler_discretization(
         energy (float): A scalar value used in computing the diffusion factor.
         chunk_size (int, optional): Size of the sub-batches; default is 128.
         store_control (bool, optional): If True, store the intermediate control values.
-        direction_fn (str, optional): The function to use for the direction of the discretization.
-                                        If "fwd", integrates using forward drift.
-                                        If "bwd", integrates using backward drift.
+        direction (int, optional): The conditioning direction of the drift, 1 for forward, 0 for backward.
 
     Returns:
         drift_norms (Tensor): Average squared control norm over the discretization.
@@ -320,6 +318,7 @@ def euler_discretization(
         # Current time based on direction
         t_val = (i - 1) * dt_val
         t_tensor = th.full((B,), t_val, device=x.device)
+        direction_tensor = th.full((B,), direction, device=x.device)
 
         # Process the neural network in chunks
         alpha_chunks = []
@@ -329,12 +328,10 @@ def euler_discretization(
             end = min(start + chunk_size, B)
             chunk_input = x[i - 1][start:end]
             chunk_t = t_tensor[start:end]
+            chunk_direction = direction_tensor[start:end]
 
             # nn returns both forward and backward drifts
-            fwd_drift, bwd_drift = nn(chunk_input, chunk_t, input_pos=data_grid)
-            # Select the appropriate drift
-            alpha_chunk = fwd_drift if direction_fn == "fwd" else bwd_drift
-
+            alpha_chunk = nn(chunk_input, chunk_t, chunk_direction, input_pos=data_grid)
             alpha_chunks.append(alpha_chunk)
 
         # Concatenate results
@@ -533,24 +530,6 @@ class DualCoarseTransform:
         return {"original": normalized_field, "upsampled": upsampled_field}
 
 
-# NN Model -----------------------------------------------------------------------------
-
-
-def init_nn():
-    return OperatorTransformer(
-        in_channel=1,
-        out_channel=1,
-        latent_dim=256,
-        pos_dim=256,
-        num_heads=4,
-        depth_enc=6,
-        depth_dec=2,
-        scale=1,
-        self_per_cross_attn=1,
-        height=64,  # to match the fine fields
-    )
-
-
 # Run ----------------------------------------------------------------------------------
 
 
@@ -606,6 +585,12 @@ def run(
     device = "cuda" if th.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # direction dictionary
+    direction_dict = {
+        "fwd": 1,
+        "bwd": 0,
+    }
+
     # Now, when creating the DatasetNormalization instance,
     coarse_normalizer = DatasetNormalization(coarse_data_path)
     fine_normalizer = DatasetNormalization(fine_data_path)
@@ -645,20 +630,6 @@ def run(
     # Upsample the coarse fields to match the size of fine fields
     import torch.nn.functional as Func
 
-    # def upsample(field, size):
-    #     field = Func.interpolate(
-    #         field.unsqueeze(0), size=size, mode="bicubic", align_corners=False
-    #     ).squeeze(0)
-    #     return field
-
-    # upsample_transform = transforms.Compose(
-    #     [transforms.Lambda(lambda field: upsample(field, size=(nx_fine, nx_fine)))]
-    # )
-
-    # Update the transforms for the coarse field datasets
-    # tr_data_0.transform = transforms.Compose([tr_data_0.transform, upsample_transform])
-    # te_data_0.transform = transforms.Compose([te_data_0.transform, upsample_transform])
-
     te_data_0 = Subset(te_data_0, rng.permutation(len(te_data_0)))
     te_data_1 = Subset(te_data_1, rng.permutation(len(te_data_1)))
 
@@ -686,7 +657,7 @@ def run(
     ts_idx[-1] = discretization_steps
 
     # For BM², we use a single neural network for both forward and backward drift
-    nn = BM2Transformer(
+    nn = BM2TransformerConditional(
         in_axis=in_axis,
         out_axis=out_axis,
         in_channel=1,
@@ -876,7 +847,7 @@ def run(
                     # This adaptive computation ensures that when the cache is nearly exhausted, we only process the remaining samples.
                     chunk_size = int(min(f_0_cache_batch.size(0), cache_batch_dim / 8))
 
-                    print("Chunk size", chunk_size)
+                    # print("Chunk size", chunk_size)
 
                     # Initialize trajectory array
                     fwd_traj = th.zeros(
@@ -909,7 +880,7 @@ def run(
                         energy=sigma,
                         chunk_size=chunk_size,
                         store_control=False,
-                        direction_fn="fwd",
+                        direction=direction_dict["fwd"],
                     )
                     # backward iteration, we simulate the forward, and then reverse the path
                     bwd_cache_x0 = fwd_traj[-1].detach()
@@ -923,7 +894,7 @@ def run(
                         energy=sigma,
                         chunk_size=chunk_size,
                         store_control=False,
-                        direction_fn="bwd",
+                        direction=direction_dict["bwd"],
                     )
 
                     fwd_cache_x0 = bwd_traj[-1].detach()
@@ -963,6 +934,18 @@ def run(
             progress.update(step_t, completed=step)
             optim.zero_grad()
 
+            # After completing iteration 1, reinitialize the optimizer state once at the beginning of iteration 2.
+            if iteration == 2 and step == (
+                1 + training_steps
+            ):  # Only at the first step of iteration 2
+                # reset optimizer state by creating a new optimizer with the same parameters
+                lr = optim.param_groups[0]["lr"]  # Preserve the current learning rate
+                optim = th.optim.Adam(nn.parameters(), lr=lr)
+                if rank == 0:
+                    console.log(
+                        f"Optimizer state reset at iteration {iteration}, step {step}"
+                    )
+
             # Get the coupled samples
             # f_1 is the original fine field
             # b_0 is the original coarse field
@@ -980,6 +963,9 @@ def run(
                 + t_epsilon
             )
 
+            forward_direction = th.ones(size=(batch_dim,), device=device)
+            backward_direction = th.zeros(size=(batch_dim,), device=device)
+
             # sample(euler_coarse, batch_fine)
             pi_f_t = sample_bridge(x_0=f_0, x_1=f_1, t=t, energy=sigma)
             # sample(euler_fine, batch_coarse)
@@ -990,11 +976,15 @@ def run(
                 with torch.profiler.record_function("BM2_Training_ForwardBackward"):
                     # # Forward targets and predictions
                     target_f_t = fwd_target(x_t=pi_b_t, x_1=f_1, t=None)
-                    prediction_f_t, _ = nn(pi_f_t, t, input_pos=None)
+                    prediction_f_t = nn(
+                        pi_f_t, t, direction=forward_direction, input_pos=None
+                    )
 
                     # Backward targets and predictions
                     target_b_t = bwd_target(x_t=pi_f_t, x_0=b_0, t=None)
-                    _, prediction_b_t = nn(pi_b_t, t, input_pos=None)
+                    prediction_b_t = nn(
+                        pi_b_t, t, direction=backward_direction, input_pos=None
+                    )
 
                     # Compute the BM² coupled loss
                     loss_f_t = (target_f_t - prediction_f_t) ** 2
@@ -1152,7 +1142,7 @@ def run(
                             energy=sigma,
                             chunk_size=f_0_test.shape[0],
                             store_control=False,
-                            direction_fn="fwd",
+                            direction=direction_dict["fwd"],
                         )
                         f_1_test = fwd_traj[-1]
 
@@ -1164,7 +1154,7 @@ def run(
                             energy=sigma,
                             chunk_size=b_1_test.shape[0],
                             store_control=False,
-                            direction_fn="bwd",
+                            direction=direction_dict["bwd"],
                         )
                         b_0_test = bwd_traj[-1]
 
@@ -1316,16 +1306,14 @@ def run(
                                     antialias=True,
                                 ).squeeze(0)
 
-                                # te_x_1 = coarsen_field(
-                                #     te_x_1,
-                                #     H=H,
-                                #     downsample_factor=1,  # no change
-                                #     method="bicubic",
-                                #     apply_gaussian_smoothing=True,
-                                #     antialias=True,
-                                # ).to(device)
-
-                                te_x_1 = te_x_1.to(device)
+                                te_x_1 = coarsen_field(
+                                    te_x_1,
+                                    H=H,
+                                    downsample_factor=2,  # to 32x32 from 64x64
+                                    method="bicubic",
+                                    apply_gaussian_smoothing=True,
+                                    antialias=True,
+                                ).to(device)
 
                                 te_s_path[0] = te_x_0
                                 drift_norm, te_p_path = euler_discretization(
@@ -1334,7 +1322,7 @@ def run(
                                     energy=sigma,
                                     chunk_size=te_x_0.shape[0],
                                     store_control=True,
-                                    direction_fn="fwd",
+                                    direction=direction_dict["fwd"],
                                 )
                                 break
 
@@ -1405,7 +1393,7 @@ def run(
                                 energy=sigma,
                                 chunk_size=te_x_1.shape[0],
                                 store_control=True,
-                                direction_fn="bwd",
+                                direction=direction_dict["bwd"],
                             )
 
                             # Log drift norm
@@ -1546,7 +1534,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_checkpointing",
-        action="store_true",
+        type=bool,
         default=True,
         help="Use checkpointing during training",
     )
