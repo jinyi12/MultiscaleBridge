@@ -73,7 +73,7 @@ DBFS = "DBFS"
 
 
 # Coarsening function
-def coarsen_field(field, filter_sigma=2.0, downsample_factor=2, method="bilinear"):
+def coarsen_field(field, filter_sigma=2.0, downsample_factor=2, method="bicubic"):
     """
     Coarsen a field by smoothing and downsampling.
 
@@ -543,44 +543,6 @@ def init_nn():
     )
 
 
-class EMAHelper:
-    # Simplified from https://github.com/ermongroup/ddim/blob/main/models/ema.py:
-    def __init__(self, module, mu=0.999, device=None):
-        self.module = module.module if isinstance(module, DDP) else module  # DDP
-        self.mu = mu
-        self.device = device
-        self.shadow = {}
-        # Register:
-        for name, param in self.module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        for name, param in self.module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].data = (
-                    1.0 - self.mu
-                ) * param.data + self.mu * self.shadow[name].data
-
-    def ema(self, module):
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name].data)
-
-    def ema_copy(self):
-        locs = self.module.locals
-        module_copy = type(self.module)(*locs).to(self.device)
-        module_copy.load_state_dict(self.module.state_dict())
-        self.ema(module_copy)
-        return module_copy
-
-    def state_dict(self):
-        return self.shadow
-
-    def load_state_dict(self, state_dict):
-        self.shadow = state_dict
-
-
 # Run ----------------------------------------------------------------------------------
 
 
@@ -634,7 +596,9 @@ def run(
 
     # Initialize wandb with a different project (only on rank 0 if using DDP)
     if rank == 0:
-        wandb.init(project="BM2_GRF_MultiscaleBridge", config=config)
+        if run_name is None:
+            run_name = wandb.run.name
+        wandb.init(project="BM2_GRF_MultiscaleBridge", config=config, name=run_name)
     # Setup data:
     tr_iter_0 = train_iter(tr_data_0, batch_dim, tr_spl_0)
     tr_iter_1 = train_iter(tr_data_1, batch_dim, tr_spl_1)
@@ -705,7 +669,7 @@ def run(
                 "ema": ema,
             },  # dont need sample_nn, as we can use `ema` directly for sampling
             console,
-            run_name=wandb.run.name,
+            run_name=run_name,
         )
         if rank == 0:
             console.log(f"Loaded checkpoint: iteration {start_iteration}, step {step}")
