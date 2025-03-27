@@ -544,10 +544,10 @@ def run(
     if run_name is not None:
         config["run_name"] = run_name
         print(f"Resuming from checkpoint of run: {run_name}")
-    # Initialize wandb with a different project (only on rank 0 if using DDP)
+    # Initialize wandb with a different project (only on rank 0 ifs using DDP)
     if rank == 0:
         wandb.init(
-            project="BM2_GRF_MultiscaleBridge_Interpolation",
+            project="dbfs_intOp_interpolation",
             config=config,
             run_name=run_name,
         )
