@@ -181,7 +181,16 @@ class QuerieEmbedder(nn.Module):
     Embeds target grids into vector representations.
     """
 
-    def __init__(self, hidden_size, pos_dim):
+    def __init__(self, hidden_size, adaLN_input_dim, adaLN_per_chunk_out_dim, pos_dim):
+        """
+        Initialize the QuerieEmbedder.
+
+        Args:
+            hidden_size: The dimension of the hidden layer
+            adaLN_input_dim: The dimension of the input layer of the adaLN modulation
+            adaLN_per_chunk_out_dim: The dimension of the output layer of the adaLN modulation for each chunk
+            pos_dim: The dimension of the position embedding
+        """
         super().__init__()
 
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -195,13 +204,17 @@ class QuerieEmbedder(nn.Module):
         )
 
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+            nn.SiLU(),
+            nn.Linear(adaLN_input_dim, 3 * adaLN_per_chunk_out_dim, bias=True),
         )
 
         self.proj = nn.Linear(pos_dim, hidden_size, bias=True)
 
     def forward(self, grid, c):
         grid = self.proj(grid)
+
+        # print("grid shape: ", grid.shape)
+        # print("c shape: ", c.shape)
 
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=1)
         queries = grid + gate_mlp.unsqueeze(1) * self.mlp(
@@ -391,7 +404,15 @@ class AttnBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning, using Flash Attention.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        adaLN_input_dim=None,
+        adaLN_per_chunk_out_dim=None,
+        **block_kwargs,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = FlashAttention(hidden_size, num_heads=num_heads, **block_kwargs)
@@ -404,8 +425,13 @@ class AttnBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
+        if adaLN_input_dim is None:
+            adaLN_input_dim = hidden_size
+        if adaLN_per_chunk_out_dim is None:
+            adaLN_per_chunk_out_dim = hidden_size
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.SiLU(),
+            nn.Linear(adaLN_input_dim, 6 * adaLN_per_chunk_out_dim, bias=True),
         )
 
     def forward(self, x, c):
@@ -426,7 +452,15 @@ class CrossAttnBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning, using Flash Attention.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        adaLN_input_dim=None,
+        adaLN_per_chunk_out_dim=None,
+        **block_kwargs,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -443,8 +477,14 @@ class CrossAttnBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
+
+        if adaLN_input_dim is None:
+            adaLN_input_dim = hidden_size
+        if adaLN_per_chunk_out_dim is None:
+            adaLN_per_chunk_out_dim = hidden_size
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 8 * hidden_size, bias=True)
+            nn.SiLU(),
+            nn.Linear(adaLN_input_dim, 8 * adaLN_per_chunk_out_dim, bias=True),
         )
 
     def forward(self, queries, context, c):
@@ -473,12 +513,19 @@ class FinalLayer(nn.Module):
     The final layer of the model.
     """
 
-    def __init__(self, hidden_size, out_channels):
+    def __init__(
+        self,
+        hidden_size,
+        adaLN_input_dim,
+        adaLN_per_chunk_out_dim,
+        out_channels,
+    ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.SiLU(),
+            nn.Linear(adaLN_input_dim, 2 * adaLN_per_chunk_out_dim, bias=True),
         )
 
     def forward(self, x, c):
@@ -488,9 +535,9 @@ class FinalLayer(nn.Module):
         return x
 
 
-class OperatorTransformer(nn.Module):
+class BM2TransformerConditional(nn.Module):
     """
-    OperatorTransformer: A transformer-based model for processing multidimensional data.
+    BM2TransformerConditional: A transformer-based model for processing multidimensional data.
 
     This model implements a transformer architecture with:
     1. Gaussian Fourier Feature mapping for positional encoding
@@ -516,9 +563,10 @@ class OperatorTransformer(nn.Module):
         scale,
         self_per_cross_attn,
         height,
+        use_checkpointing=True,
     ):
         """
-        Initialize the OperatorTransformer model.
+        Initialize the BM2TransformerConditional model.
 
         Args:
             in_axis: Number of input axes, e.g. 2 for 2D data
@@ -533,6 +581,7 @@ class OperatorTransformer(nn.Module):
             scale: Scale parameter for Gaussian Fourier features
             self_per_cross_attn: Number of self-attention blocks per cross-attention block
             height: Height dimension of the spatial grid
+            use_checkpointing: Whether to use checkpointing
         """
         super().__init__()
 
@@ -549,6 +598,7 @@ class OperatorTransformer(nn.Module):
             scale,
             self_per_cross_attn,
             height,
+            use_checkpointing,
         ]
 
         self.num_heads = num_heads
@@ -556,6 +606,7 @@ class OperatorTransformer(nn.Module):
         self.input_axis = in_axis
         self.output_axis = out_axis
         self.hidden_size = latent_dim
+        self.use_checkpointing = use_checkpointing
 
         # Gaussian Fourier Feature Transform for 2D positions
         self.gfft = GaussianFourierFeatureTransform(2, latent_dim // 2, scale=scale)
@@ -567,30 +618,88 @@ class OperatorTransformer(nn.Module):
         # i.e. takes data of shape (b, (h w), c) and embeds it to the latent dimension
         self.x_embedder = nn.Linear(in_channel, latent_dim, bias=True)
 
-        # Rename for consistency with transformer.py
+        # Embedders for time and direction
         self.time_embedder = TimestepEmbedder(latent_dim)
-        self.query_embedder = QuerieEmbedder(latent_dim, latent_dim)
+        self.direction_embedder = TimestepEmbedder(latent_dim)
+
+        # Embedder for queries
+        query_embedder_adaLN_input_dim = 2 * latent_dim
+        query_embedder_adaLN_per_chunk_out_dim = latent_dim
+        self.query_embedder = QuerieEmbedder(
+            latent_dim,
+            query_embedder_adaLN_input_dim,
+            query_embedder_adaLN_per_chunk_out_dim,
+            pos_dim,
+        )
 
         # Restructure to match the encoder-decoder block structure in transformer.py
         self.enc_block = nn.ModuleList([])
+        # again, since we are concatenating t_emb and direction_emb, we need to double the
+        # latent dimension for the adaLN modulation inputs.
+        # the adaLN modulation outputs are not changed, we want to project onto the latent dimension
+        attn_adaLN_input_dim = 2 * latent_dim
+        attn_adaLN_per_chunk_out_dim = latent_dim
+        cross_attn_adaLN_input_dim = 2 * latent_dim
+        cross_attn_adaLN_per_chunk_out_dim = latent_dim
         for _ in range(depth_enc):
             enc_attns = nn.ModuleList(
-                [AttnBlock(latent_dim, num_heads) for _ in range(self_per_cross_attn)]
+                [
+                    AttnBlock(
+                        latent_dim,
+                        num_heads,
+                        adaLN_input_dim=attn_adaLN_input_dim,
+                        adaLN_per_chunk_out_dim=attn_adaLN_per_chunk_out_dim,
+                    )
+                    for _ in range(self_per_cross_attn)
+                ]
             )
             self.enc_block.append(
-                nn.ModuleList([CrossAttnBlock(latent_dim, cross_heads), enc_attns])
+                nn.ModuleList(
+                    [
+                        CrossAttnBlock(
+                            latent_dim,
+                            cross_heads,
+                            adaLN_input_dim=cross_attn_adaLN_input_dim,
+                            adaLN_per_chunk_out_dim=cross_attn_adaLN_per_chunk_out_dim,
+                        ),
+                        enc_attns,
+                    ]
+                )
             )
 
         self.dec_block = nn.ModuleList([])
         for _ in range(depth_dec):
             dec_attns = nn.ModuleList(
-                [AttnBlock(latent_dim, num_heads) for _ in range(self_per_cross_attn)]
+                [
+                    AttnBlock(
+                        latent_dim,
+                        num_heads,
+                        adaLN_input_dim=attn_adaLN_input_dim,
+                        adaLN_per_chunk_out_dim=attn_adaLN_per_chunk_out_dim,
+                    )
+                    for _ in range(self_per_cross_attn)
+                ]
             )
             self.dec_block.append(
-                nn.ModuleList([CrossAttnBlock(latent_dim, cross_heads), dec_attns])
+                nn.ModuleList(
+                    [
+                        CrossAttnBlock(
+                            latent_dim,
+                            cross_heads,
+                            adaLN_input_dim=cross_attn_adaLN_input_dim,
+                            adaLN_per_chunk_out_dim=cross_attn_adaLN_per_chunk_out_dim,
+                        ),
+                        dec_attns,
+                    ]
+                )
             )
 
-        self.final_layer = FinalLayer(latent_dim, out_channel)
+        self.final_layer = FinalLayer(
+            latent_dim,
+            adaLN_input_dim=attn_adaLN_input_dim,
+            adaLN_per_chunk_out_dim=attn_adaLN_per_chunk_out_dim,
+            out_channels=out_channel,
+        )
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -651,13 +760,21 @@ class OperatorTransformer(nn.Module):
 
         return ckpt_forward
 
-    def forward(self, data, t, input_pos=None, output_pos=None):
+    def maybe_checkpoint(self, module, *args):
+        """Helper method to optionally apply checkpointing based on configuration"""
+        if self.training and self.use_checkpointing and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(module), *args)
+        else:
+            return module(*args)
+
+    def forward(self, data, t, direction, input_pos=None, output_pos=None):
         """
         Forward pass through the OperatorTransformer.
 
         Args:
             data: Input tensor of shape [batch_size, channels, height, width]
             t: Time step tensor of shape [batch_size]
+            direction: Direction of the discretization, 1 for forward, 0 for backward
             input_pos: Optional input positions, if None, uses a generated grid
             output_pos: Optional output positions (unused in this implementation)
 
@@ -673,6 +790,12 @@ class OperatorTransformer(nn.Module):
         # Step 2: Flatten spatial dimensions
         data = rearrange(data, "b ... c -> b (...) c")
 
+        # print("data shape: ", data.shape)
+        # print("axis: ", axis)
+        # print("b: ", b)
+        # print("device: ", device)
+        # print("dtype: ", dtype)
+
         # Step 3: Generate or use provided position encodings
         if input_pos is None:
             grid = make_grid(axis[0])
@@ -681,60 +804,60 @@ class OperatorTransformer(nn.Module):
             input_pos = output_pos = self.gfft(grid)
         else:
             # Use provided positions
-            input_pos = input_pos
-            output_pos = output_pos if output_pos is not None else input_pos
+            input_pos = output_pos = self.gfft(input_pos)
 
         # Step 4: Apply x_embedder to data and add positional encoding
         input_emb = self.x_embedder(data) + input_pos
         t_emb = self.time_embedder(t)
 
+        # Step 4.1: Apply direction embedding to t_emb
+        direction_emb = self.direction_embedder(direction)
+
+        condition_emb = torch.cat([t_emb, direction_emb], dim=1)
+
+        # print("output_pos shape: ", output_pos.shape)
+        # print("condition_emb shape: ", condition_emb.shape)
+
         # Step 5: Generate queries from output positions
-        queries = self.query_embedder(output_pos, t_emb)
+        queries = self.query_embedder(output_pos, condition_emb)
 
         # Step 6: Initialize latent representation
         x = self.latents.repeat(b, 1, 1)
-        c = t_emb
 
         # Step 7: Process through encoder blocks
         for block in self.enc_block:
             cross_attn, attns = block[0], block[-1]
             x = (
-                torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(cross_attn), x, input_emb, c
-                )
+                self.maybe_checkpoint(cross_attn, x, input_emb, condition_emb)
                 if self.training
-                else cross_attn(x, input_emb, c)
+                else cross_attn(x, input_emb, condition_emb)
             )
 
             for l in range(len(attns)):
                 x = (
-                    torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(attns[l]), x, c)
+                    self.maybe_checkpoint(attns[l], x, condition_emb)
                     if self.training
-                    else attns[l](x, c)
+                    else attns[l](x, condition_emb)
                 )
 
         # Step 8: Process through decoder blocks
         for block in self.dec_block:
             cross_attn, attns = block[0], block[-1]
             queries = (
-                torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(cross_attn), queries, x, c
-                )
+                self.maybe_checkpoint(cross_attn, queries, x, condition_emb)
                 if self.training
-                else cross_attn(queries, x, c)
+                else cross_attn(queries, x, condition_emb)
             )
 
             for l in range(len(attns)):
                 queries = (
-                    torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(attns[l]), queries, c
-                    )
+                    self.maybe_checkpoint(attns[l], queries, condition_emb)
                     if self.training
-                    else attns[l](queries, c)
+                    else attns[l](queries, condition_emb)
                 )
 
         # Step 9: Generate final output through the final layer
-        out = self.final_layer(queries, c)
+        out = self.final_layer(queries, condition_emb)
 
         # Step 10: Reshape output to expected format [batch, channels, height, width]
         out = rearrange(out, "b (h w) c -> b c h w", h=axis[0], w=axis[1])
@@ -791,6 +914,7 @@ class OperatorTransformer_1d(nn.Module):
         scale,
         self_per_cross_attn,
         height,
+        use_checkpointing=True,
     ):
         """
         Initialize the OperatorTransformer_1d model.
@@ -835,6 +959,7 @@ class OperatorTransformer_1d(nn.Module):
         self.hidden_size = latent_dim
         # GFFT is no longer used for positional encoding
         self.height = height
+        self.use_checkpointing = use_checkpointing
 
         # Add input embedder similar to transformer.py
         self.x_embedder = nn.Linear(in_channel, latent_dim)
@@ -844,7 +969,7 @@ class OperatorTransformer_1d(nn.Module):
 
         in_sizes = [latent_dim * 2, latent_dim, in_channel]
 
-        self.query_embedder = QuerieEmbedder(latent_dim, pos_dim)
+        self.query_embedder = QuerieEmbedder(2 * latent_dim, latent_dim)
         self.time_embedder = TimestepEmbedder(latent_dim)
 
         # Build the decoder blocks: self-attention followed by cross-attention
@@ -904,6 +1029,13 @@ class OperatorTransformer_1d(nn.Module):
 
         return ckpt_forward
 
+    def maybe_checkpoint(self, module, *args):
+        """Helper method to optionally apply checkpointing based on configuration"""
+        if self.training and self.use_checkpointing and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(module), *args)
+        else:
+            return module(*args)
+
     def forward(self, data, t, input_pos=None, output_pos=None):
         """
         Forward pass through the OperatorTransformer_1d.
@@ -960,8 +1092,8 @@ class OperatorTransformer_1d(nn.Module):
             if isinstance(block, AttnBlock):
                 # Self-attention refines the query representation
                 if use_checkpointing:
-                    queries = torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(block),
+                    queries = self.maybe_checkpoint(
+                        block,
                         queries,
                         t_emb,
                         use_reentrant=False,
@@ -971,8 +1103,8 @@ class OperatorTransformer_1d(nn.Module):
             elif isinstance(block, CrossAttnBlock):
                 # Cross-attention incorporates contextual information
                 if use_checkpointing:
-                    queries = torch.utils.checkpoint.checkpoint(
-                        self.ckpt_wrapper(block),
+                    queries = self.maybe_checkpoint(
+                        block,
                         queries,
                         input_emb,  # Use input_emb as context instead of GFFT-processed
                         t_emb,
